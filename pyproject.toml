@@ -1,0 +1,65 @@
+[tool.poetry]
+name = "mxm-dataio"
+version = "0.1.0"
+description = "**Unified ingestion, caching, and audit layer for the Money Ex Machina ecosystem.**"
+authors = ["mxm <contact@moneyexmachina.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+mxm-config = { git = "https://github.com/moneyexmachina/mxm-config.git", tag = "v0.2.0" }
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# -------------------------
+# Coding standards
+# -------------------------
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+# Select rulesets; expand gradually if desired
+select = ["E", "F", "B", "ANN"]
+ignore = ["ANN101", "ANN102"]
+# Exclude common non-source dirs
+exclude = ["build", "dist", ".venv"]
+
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+combine_as_imports = true
+
+[tool.pyright]
+typeCheckingMode = "strict"            # or "strict" if you want more enforcement
+include = ["mxm_dataio"]
+exclude = ["build", "dist", "docs", ".venv"]
+pythonVersion = "3.12"
+pythonPlatform = "All"
+reportMissingImports = "error"
+reportMissingTypeStubs = "warning"
+
+[tool.poetry.group.dev.dependencies]
+isort = "^6.0.1"
+black = "^25.9.0"
+ruff = "^0.13.2"
+pytest = "^8.4.2"
+ipython = "^9.6.0"
+
+
+[tool.pytest.ini_options]
+# Base configuration
+addopts = "-ra -q"
+
+# Define custom markers
+markers = [
+    "integration: tests hitting external services (API, DB, network)",
+    "slow: long-running tests (>30s, heavy compute/backtest)",
+]
