@@ -1,0 +1,16 @@
+# ==============================================
+# mxm-dataio/config/profile.yaml
+# ----------------------------------------------
+# Configuration profiles (e.g., default, offline, test)
+# allowing multiple runtime configurations under
+# the same environment.
+# ==============================================
+
+profiles:
+  default:
+    description: "Standard configuration for interactive or scheduled runs."
+  offline:
+    description: "Run without accessing external data sources."
+  test:
+    description: "Lightweight setup for unit testing."
+

@@ -1,0 +1,10 @@
+# ==============================================
+# mxm-dataio/config/environment.yaml
+# ----------------------------------------------
+# Environment-specific overrides for data fetch
+# and storage behaviour (none yet).
+# ==============================================
+
+dev: {}
+
+prod: {}

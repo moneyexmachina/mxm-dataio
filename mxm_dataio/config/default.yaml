@@ -1,0 +1,18 @@
+# ==============================================
+# mxm-dataio/config/default.yaml
+# ----------------------------------------------
+# Defines base path structure and subdirectories
+# for sources handled by the dataio package.
+# ==============================================
+
+paths:
+  # Fully resolved data root, composed from machine.yaml’s
+  # data_root_base, plus env and profile.
+  data_root: ${paths.data_root_base}/${mxm_env}/dataio/${mxm_profile}
+  db_path: ${paths.data_root}/dataio.sqlite
+  responses_dir: ${paths.data_root}/responses
+
+  # (Future extension points)
+  # etf: ${paths.data_root}/etf
+  # futures: ${paths.data_root}/futures
+  # events: ${paths.data_root}/events

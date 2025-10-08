@@ -1,0 +1,19 @@
+# ==============================================
+# mxm-dataio/config/machine.yaml
+# ----------------------------------------------
+
+
+# Defines where data physically lives on each machine.
+# ==============================================
+
+bridge:
+  paths:
+    data_root_base: /Users/mxm/mxm-data
+
+wildling:
+  paths:
+    data_root_base: /mnt/mxm-data
+
+monolith:
+  paths:
+    data_root_base: /srv/mxm-data
