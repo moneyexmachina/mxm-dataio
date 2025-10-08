@@ -1,143 +1,301 @@
 # mxm-dataio
 
-**Unified ingestion, caching, and audit layer for the Money Ex Machina ecosystem.**
+Unified ingestion, caching, and audit layer for the Money Ex Machina (MXM) ecosystem. `mxm-dataio` records every interaction with an external system—who/what/when, the exact bytes returned, and optional transport metadata—so downstream packages are reproducible and auditable.
 
-`mxm-dataio` provides a minimal, protocol-agnostic structure for interacting with external data systems.  
-It records every session, request, and response, enabling complete reproducibility and auditability of all data ingress into MXM — whether from web APIs, file systems, or trading interfaces like Interactive Brokers.
+## Purpose & scope
 
----
+**What it is**
+- A lightweight, protocol-agnostic layer that models external interactions as `Session → Request → Response`, persists metadata in SQLite, and payloads as files.
+- A small registry + adapter interface so applications can plug in sources (web APIs, files, brokers).
+- A simple runtime API (`DataIoSession`) to run fetch/send operations with automatic persistence and optional caching.
 
-## 🧭 Purpose
+**What it’s not**
+- Not a domain database for market data or reference data.
+- Not a parsing/ETL framework. Domain packages (e.g., `mxm-marketdata`, `mxm-refdata`) parse/normalize and store into their own schemas, while linking back to `mxm-dataio` for provenance.
 
-The package defines a **universal ingestion model**:
+## Architecture at a glance
 
 ```
-Session(source="yahoo", as_of="2025-10-07")
-    └── Request(kind="daily_bars", params={symbol: "CSPX.L", start: "2010-01-01"})
-          └── Response(status="ok", checksum="...", bytes_path=".../responses/<checksum>.bin")
+App (e.g. mxm-datakraken)
+  │
+  ├─ mxm-config → cfg (machine/env/profile-specific paths)
+  │
+  └─ mxm-dataio
+      ├─ models.py        (Session, Request, Response)
+      ├─ store.py         (SQLite metadata + filesystem payloads)
+      ├─ adapters.py      (MXMDataIoAdapter + Fetcher/Sender/Streamer, AdapterResult)
+      ├─ registry.py      (register/resolve adapters)
+      └─ api.py           (DataIoSession: runtime orchestration)
 ```
 
-Each `Session` groups multiple `Request` objects, each of which produces a `Response`.  
-The responses are stored as raw payloads (bytes or serialized objects), while all metadata is recorded in a local SQLite database.
-
-This allows any data source — HTTP, file, streaming, or API — to be captured with the same structure and queried later.
-
----
-
-## Design Principles
-
-- **Protocol-agnostic**: works with HTTP, FTP, sockets, APIs, or any custom connector.  
-- **Reproducible**: every interaction is timestamped, hashed, and stored.  
-- **Composable**: adapters can be registered per source (`yahoo`, `ibkr`, etc.).  
-- **Lightweight**: no runtime dependencies beyond Python standard library.  
-- **Auditable**: full trail of what was fetched, when, and from where.  
-
----
-
-## Project Layout
-
-```text
-mxm-dataio/
- ├── mxm_dataio/
- │    ├── __init__.py
- │    ├── models.py       # Session, Request, Response dataclasses
- │    ├── store.py        # SQLite + filesystem persistence
- │    ├── fetcher.py      # Generic HTTP fetcher
- │    ├── api.py          # Public context manager API (IngestSession)
- │    ├── adapters/       # Optional protocol adapters (http, ibkr, etc.)
- │    └── utils.py
- ├── configs/
- │    └── default.yaml    # Data root under ${mxm.data_root}/dataio/
- ├── tests/
- │    └── test_dataio_basic.py
- ├── pyproject.toml
- └── README.md
+**Storage layout**
+```
+${paths.data_root}/
+  dataio.sqlite
+  responses/
+    <sha256>.bin         # raw bytes (exact payload)
+    <sha256>.meta.json   # optional sidecar metadata (transport info)
 ```
 
+## Core concepts
 
-## Core Concepts
+- **Session** — groups related Requests (e.g., a daily run). Fields include `source`, `mode`, `as_of`, `started_at`, `ended_at`.
+- **Request** — deterministic identity of an external call: `kind`, `method`, `params`, optional `body`, and a stable `hash` used for caching.
+- **Response** — what came back: `status`, `checksum`, `size_bytes`, `sequence` (for future streaming), `path` of payload.
+- **Adapter** — small class that knows how to talk to a system, via capabilities:
+  - `Fetcher.fetch(request) -> bytes | AdapterResult`
+  - `Sender.send(request, payload: bytes) -> bytes | dict | AdapterResult`
+  - `Streamer.stream(request)` (future)
+- **Registry** — process-local map of `source` → adapter instance.
+- **DataIoSession** — context manager that opens a Session, creates Requests, resolves the adapter, executes I/O, persists Responses, and optionally returns cached results by Request hash.
 
-| Entity | Description | Typical fields |
-|--------|--------------|----------------|
-| **Session** | Logical group of requests made to a single source (e.g. “Yahoo daily fetch”). | `id`, `source`, `as_of`, `status` |
-| **Request** | Individual call made under a session. | `endpoint`, `params_hash`, `started_at`, `status` |
-| **Response** | Recorded reply from a request. | `status_code`, `checksum`, `bytes_path` |
+## Design principles
 
----
+- **Protocol-agnostic & dependency-light**: stdlib only (sqlite3, pathlib, json, hashlib).
+- **Deterministic & auditable**: stable hashing, checksums, reproducible layout.
+- **Separation of concerns**:
+  - `mxm-dataio` archives raw bytes + provenance.
+  - Domain packages parse/normalize into queryable schemas, while storing `response_id`/`checksum` for provenance.
+- **Extensible**: adapters are tiny; sidecar metadata via `AdapterResult` requires no DB migration.
 
-## Example Usage
+## Adapters & registry
+
+```python
+# adapters.py (excerpt)
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+from mxm_dataio.models import Request
+
+@runtime_checkable
+class MXMDataIoAdapter(Protocol):
+    source: str
+    def describe(self) -> str: ...
+    def close(self) -> None: ...
+
+@runtime_checkable
+class Fetcher(MXMDataIoAdapter, Protocol):
+    def fetch(self, request: Request) -> bytes: ...
+
+@runtime_checkable
+class Sender(MXMDataIoAdapter, Protocol):
+    def send(self, request: Request, payload: bytes) -> dict[str, str]: ...
+
+@dataclass(slots=True)
+class AdapterResult:
+    data: bytes
+    content_type: str | None = None
+    encoding: str | None = None
+    transport_status: int | None = None
+    url: str | None = None
+    elapsed_ms: int | None = None
+    headers: dict[str, str] | None = None
+    adapter_meta: dict[str, Any] | None = None
+    def meta_dict(self) -> dict[str, Any]:
+        return {
+            k: v for k, v in {
+                "content_type": self.content_type,
+                "encoding": self.encoding,
+                "transport_status": self.transport_status,
+                "url": self.url,
+                "elapsed_ms": self.elapsed_ms,
+                "headers": self.headers,
+                "adapter_meta": self.adapter_meta,
+            }.items() if v is not None
+        }
+```
+
+```python
+# registry.py (excerpt)
+from mxm_dataio.adapters import MXMDataIoAdapter
+
+def register(name: str, adapter: MXMDataIoAdapter) -> None: ...
+def resolve_adapter(name: str) -> MXMDataIoAdapter: ...
+def unregister(name: str) -> None: ...
+def clear_registry() -> None: ...
+def list_registered() -> list[str]: ...
+def describe_registry() -> str: ...
+```
+
+## Runtime API: DataIoSession
+
+```python
+from mxm_dataio.api import DataIoSession
+from mxm_dataio.models import RequestMethod
+
+with DataIoSession(source="justetf", cfg=cfg) as io:
+    req = io.request(kind="etf_profile", params={"isin": "LU0274211480"})
+    resp = io.fetch(req)  # Adapter.fetch → bytes or AdapterResult
+    print(resp.status, resp.path)  # 'ok', .../responses/<checksum>.bin
+```
+
+- **Capability checks** — `.fetch()` requires a `Fetcher` adapter; `.send()` requires a `Sender`. Raises `TypeError` otherwise.
+- **Caching** — enabled by default (`use_cache=True`). If a previous Request with the same `hash` exists, returns the most recent Response (no duplicate I/O).
+- **Sidecar metadata** — if an adapter returns `AdapterResult`, its `meta_dict()` is written to `responses/<checksum>.meta.json` (deterministic JSON, readable Unicode).
+
+## Configuration (via mxm-config)
+
+Each application owns where its data lives.
+
+```python
+from mxm_config import load_config
+cfg = load_config("mxm-datakraken", env="dev", profile="default")
+
+# cfg["paths"] should include:
+#   data_root      -> base folder for this app/env/profile
+#   db_path        -> e.g. ${data_root}/dataio.sqlite
+#   responses_dir  -> e.g. ${data_root}/responses
+```
+
+Recommended defaults inside the *app’s* `config/default.yaml`:
+
+```yaml
+paths:
+  data_root: ${paths.data_root_base}/${mxm_env}/datakraken/${mxm_profile}
+  db_path: ${paths.data_root}/dataio.sqlite
+  responses_dir: ${paths.data_root}/responses
+```
+
+## Quick start examples
+
+### 1) Register an adapter and fetch
+
+```python
+from mxm_config import load_config
+from mxm_dataio.registry import register
+from mxm_dataio.api import DataIoSession
+from mxm_dataio.adapters import AdapterResult
+from mxm_dataio.models import Request
+
+class JustETFFetcher:
+    source = "justetf"
+    def fetch(self, request: Request) -> AdapterResult:
+        data = b'{"name":"Example ETF"}'
+        return AdapterResult(
+            data=data,
+            content_type="application/json",
+            transport_status=200,
+            url="https://api.justetf.example/etf?isin=LU0274211480",
+            headers={"x-ratelimit-remaining": "99"},
+        )
+    def describe(self) -> str: return "JustETF demo fetcher"
+    def close(self) -> None: pass
+
+cfg = load_config("mxm-datakraken", env="dev", profile="default")
+register("justetf", JustETFFetcher())
+
+with DataIoSession(source="justetf", cfg=cfg) as io:
+    req = io.request(kind="etf_profile", params={"isin": "LU0274211480"})
+    resp = io.fetch(req)
+
+print(resp.status, resp.path)
+# Sidecar metadata at .../responses/<checksum>.meta.json
+```
+
+### 2) Send with metadata
+
+```python
+from mxm_dataio.models import RequestMethod, Request
+
+class BrokerSender:
+    source = "ibkr"
+    def send(self, request: Request, payload: bytes) -> AdapterResult:
+        # pretend we placed an order
+        return AdapterResult(
+            data=b'{"order_id":12345,"status":"accepted"}',
+            content_type="application/json",
+            transport_status=202,
+            adapter_meta={"env": "paper"},
+        )
+    def describe(self) -> str: return "Broker demo sender"
+    def close(self) -> None: pass
+
+register("ibkr", BrokerSender())
+with DataIoSession(source="ibkr", cfg=cfg) as io:
+    req = io.request(kind="place_order", method=RequestMethod.POST, body={"symbol":"CLZ5"})
+    resp = io.send(req, payload=b'{"qty":1,"side":"BUY"}')
+```
+
+### 3) Read payload + sidecar metadata
 
 ```python
 from pathlib import Path
-from mxm_dataio.api import IngestSession
+from mxm_dataio.store import Store
 
-root = Path("~/mxm-data/dev/dataio/default").expanduser()
-
-with IngestSession(root=root, source="yahoo") as sess:
-    resp = sess.request(
-        endpoint="https://query1.finance.yahoo.com/v7/finance/download/CSPX.L",
-        params={"period1": "1262304000", "interval": "1d"},
-    )
-
-print("Response stored at:", resp.bytes_path)
+store = Store.get_instance(cfg)
+raw = Path(resp.path).read_bytes()
+meta = store.read_metadata(resp.checksum)  # raises if none was written
 ```
 
-This produces:
-- `dataio.sqlite` — the metadata database  
-- `responses/<checksum>.bin` — raw response bytes  
-
-## Adapter Interface
-
-To extend `mxm-dataio` for any external system, implement a simple adapter:
+### 4) Caching behavior
 
 ```python
-class Fetcher:
-    def fetch(self, request: Request) -> bytes:
-        ...
+with DataIoSession(source="justetf", cfg=cfg, use_cache=True) as io:
+    r1 = io.request(kind="k", params={"x": 1}); resp1 = io.fetch(r1)
+    r2 = io.request(kind="k", params={"x": 1}); resp2 = io.fetch(r2)
+assert resp2.id == resp1.id  # reused cached Response
 ```
 
-Register it in the global registry:
+## Testing & quality
 
-```python
-from mxm_dataio.registry import register
+- **Test suites** (fast, isolated, tmp paths):
+  - `tests/test_store.py` + `test_store_extended.py` — schema, atomicity, payload I/O, singleton, robustness.
+  - `tests/test_registry.py` — register/resolve/duplicate/unregister/describe.
+  - `tests/test_api.py` — lifecycle, fetch/send persistence, cache, capability guards.
+  - `tests/test_store_metadata.py` + `tests/test_api_adapterresult.py` — sidecar metadata roundtrip, AdapterResult paths.
+- **Style & Type**: Black, Ruff, Pyright `--strict`.
+- No network in tests; adapters are dummies.
 
-register("ibkr", IBFetcher())
-register("yahoo", YahooFetcher())
+## Design decisions (why this way?)
+
+- **No SQLAlchemy** in `mxm-dataio`: the metadata model is tiny, stable, and well-served by sqlite3. Domain packages may use ORMs for their richer schemas.
+- **Sidecar metadata (AdapterResult)**: captures transport facts (status, headers, URL, elapsed) without DB migrations; JSON is deterministic and Unicode-friendly.
+- **One adapter per DataIoSession**: keeps audit trail clear and deterministic.
+- **Caching by Request hash**: avoids duplicate I/O for identical requests; still returns the raw bytes exactly as previously archived.
+
+## Roadmap
+
+- DB indexes in SQLite (`requests.hash`, `responses.request_id`) for scale.
+- Replay helpers in `Store` (`get_cached_response_by_hash`).
+- Migrations: schema versioning via a small `meta` table.
+- Compression / TTL: optional payload compression, retention policies.
+- Streaming: finalize `Streamer` as `AsyncIterator[bytes]`, persist sequenced frames.
+- CLI tools: list sessions/requests, inspect responses, dump payloads.
+- Reference adapters: `LocalFileFetcher`, minimal `HttpFetcher` (stdlib).
+
+## Repository layout
+
+```
+mxm_dataio/
+  __init__.py
+  api.py
+  adapters.py
+  models.py
+  registry.py
+  store.py
+tests/
+  test_models.py
+  test_store.py
+  test_store_extended.py
+  test_registry.py
+  test_api.py
+  test_store_metadata.py
+  test_api_adapterresult.py
+config/
+  default.yaml    # (in consumer apps; shown here for reference)
 ```
 
-Now any `IngestSession(source="ibkr")` automatically routes requests through the `IBFetcher`.
+## Versioning & compatibility
 
-## Integration Points
+- Python 3.11+ recommended (tested with latest stable).
+- No external runtime dependencies besides `mxm-config` for path resolution.
+- Semantic versioning once published; internal changes guarded by tests.
 
-| MXM Package | How it uses `mxm-dataio` |
-|--------------|--------------------------|
-| **`mxm-datakraken`** | Records regulator and web-based reference data scrapes. |
-| **`mxm-refdata`** | Optionally reconciles entities based on stored responses. |
-| **`mxm-marketdata`** | Collects price, volume, and event data from APIs (Yahoo, IBKR, etc.) via the same ingestion interface. |
+## Using with domain packages
 
----
-
-## 🧱 Storage Layout
-
-```text
-${mxm.data_root}/dataio/
- ├── dataio.sqlite          # Metadata DB
- └── responses/             # Raw payloads (by checksum)
-      ├── 1a2b3c...bin
-      └── ...
-```
-
----
-
-## Testing
-
-```bash
-poetry install
-pytest -q
-```
-
+- **mxm-datakraken** (reference data): adapters fetch raw web/regulator data; package parses into normalized entities; every entity stores `source_response_id`.
+- **mxm-marketdata** (prices/volumes/CA): adapters fetch OHLCV; package writes columnar/DB; rows carry `source_response_id` for audit/replay.
+- **mxm-refdata**: reconciliation logic; may replay past `Response`s by `as_of`.
 
 ## License
 
-All code © Money Ex Machina.  
-Released under the MIT License unless otherwise specified.
+TBD by repository (MIT/Apache-2.0 typically). Add the appropriate `LICENSE` file.

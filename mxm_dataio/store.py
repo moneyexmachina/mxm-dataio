@@ -15,6 +15,7 @@ Design principles:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -209,6 +210,29 @@ class Store:
         if self._checksum(data) != checksum:
             raise ValueError(f"Checksum mismatch for {path}")
         return data
+
+    def write_metadata(self, checksum: str, meta: dict[str, Any]) -> Path:
+        """Write response metadata as a sidecar JSON file next to the payload.
+
+        Uses sorted keys and minified separators for determinism, and
+        ensure_ascii=False for human-readable Unicode.
+        """
+        path = self.responses_dir / f"{checksum}.meta.json"
+        if not path.exists():
+            text = json.dumps(
+                meta,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            path.write_text(text, encoding="utf-8")
+        return path
+
+    def read_metadata(self, checksum: str) -> dict[str, Any]:
+        import json
+
+        path = self.responses_dir / f"{checksum}.meta.json"
+        return json.loads(path.read_text(encoding="utf-8"))
 
     # ------------------------------------------------------------------ #
     # Utility helpers
