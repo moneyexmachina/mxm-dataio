@@ -125,6 +125,22 @@ class Store:
                 );
                 """
             )
+            # Indexes (idempotent and safe on existing DBs)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_requests_hash ON requests(hash);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_responses_request ON responses(request_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_responses_checksum ON responses(checksum);"
+            )
 
     # ------------------------------------------------------------------ #
     # Insert methods

@@ -104,3 +104,15 @@ def test_large_payload_roundtrip(store: Store) -> None:
     out = store.read_payload(path.stem)
     assert out == data
     assert len(out) == len(data)
+
+
+def test_indexes_created(store: Store) -> None:
+    with store.connect() as conn:
+        names = {row[1] for row in conn.execute("PRAGMA index_list('requests')")}
+        assert "idx_requests_hash" in names
+        assert "idx_requests_session" in names
+
+        names = {row[1] for row in conn.execute("PRAGMA index_list('responses')")}
+        assert "idx_responses_request" in names
+        assert "idx_responses_created" in names
+        assert "idx_responses_checksum" in names  # if you kept the optional one
