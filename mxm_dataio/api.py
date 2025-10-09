@@ -22,7 +22,6 @@ Notes
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from types import TracebackType
 from typing import Any, Optional, Type
 
@@ -104,19 +103,7 @@ class DataIoSession:
         if self._session is None:
             return
         self._session.end()
-        # Update ended_at (store has no explicit update; do it here).
-        with self.store.connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET ended_at = ? WHERE id = ?",
-                (
-                    (
-                        self._session.ended_at.isoformat()
-                        if self._session.ended_at
-                        else None
-                    ),
-                    self._session.id,
-                ),
-            )
+        self.store.mark_session_ended(self._session.id, self._session.ended_at)
 
     # ------------------------------------------------------------------ #
     # Request construction
@@ -242,31 +229,7 @@ class DataIoSession:
 
     def _maybe_get_cached_response(self, *, request_hash: str) -> Optional[Response]:
         """Return the most recent Response for a previously-seen request hash, if any."""
-        with self.store.connect() as conn:
-            # Find existing request by deterministic hash
-            row_req = conn.execute(
-                "SELECT id FROM requests WHERE hash = ? ORDER BY created_at DESC LIMIT 1",
-                (request_hash,),
-            ).fetchone()
-            if row_req is None:
-                return None
-
-            # Find most recent response for that request
-            row_resp = conn.execute(
-                """
-                SELECT id, request_id, status, sequence, checksum, path, created_at, size_bytes
-                FROM responses
-                WHERE request_id = ?
-                ORDER BY created_at DESC, COALESCE(sequence, -1) DESC
-                LIMIT 1
-                """,
-                (row_req[0],),
-            ).fetchone()
-
-            if row_resp is None:
-                return None
-
-            return _row_to_response(row_resp)
+        return self.store.get_cached_response_by_request_hash(request_hash)
 
 
 # --------------------------------------------------------------------------- #
@@ -280,10 +243,8 @@ def _extract_bytes_and_meta(
     """Normalize adapter returns to (bytes, optional_metadata)."""
     if isinstance(obj, AdapterResult):
         return obj.data, obj.meta_dict()
-    if isinstance(obj, (bytes, bytearray, memoryview)):
-        return bytes(obj), None
-    # Defensive: this should not happen for fetch(); keep a clear error.
-    raise TypeError(f"Unsupported adapter return type: {type(obj)!r}")
+    # By type hint, anything else here is bytes.
+    return obj, None
 
 
 def _ensure_bytes(payload: bytes | dict[str, Any]) -> bytes:
@@ -291,19 +252,3 @@ def _ensure_bytes(payload: bytes | dict[str, Any]) -> bytes:
     if isinstance(payload, (bytes, bytearray, memoryview)):
         return bytes(payload)
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _row_to_response(row: tuple[Any, ...]) -> Response:
-    """Convert a SELECT row into a Response dataclass."""
-    # Expected order from query:
-    #   id, request_id, status, sequence, checksum, path, created_at, size_bytes
-    return Response(
-        id=row[0],
-        request_id=row[1],
-        status=ResponseStatus(row[2]),
-        sequence=row[3],
-        checksum=row[4],
-        path=row[5],
-        created_at=datetime.fromisoformat(row[6]),
-        size_bytes=row[7],
-    )

@@ -116,3 +116,54 @@ def test_indexes_created(store: Store) -> None:
         assert "idx_responses_request" in names
         assert "idx_responses_created" in names
         assert "idx_responses_checksum" in names  # if you kept the optional one
+
+
+def test_store_helpers_end_and_cache(store: Store) -> None:
+    from datetime import datetime, timezone
+
+    from mxm_dataio.models import (
+        Request,
+        RequestMethod,
+        Response,
+        ResponseStatus,
+        Session,
+    )
+
+    sess = Session(source="unit")
+    store.insert_session(sess)
+
+    end = datetime.now(tz=timezone.utc).replace(microsecond=0)
+    store.mark_session_ended(sess.id, end)
+    with store.connect() as conn:
+        ended = conn.execute(
+            "SELECT ended_at FROM sessions WHERE id = ?", (sess.id,)
+        ).fetchone()[0]
+    assert ended == end.isoformat()
+
+    req = Request(
+        session_id=sess.id, kind="k", method=RequestMethod.GET, params={"a": 1}
+    )
+    store.insert_request(req)
+    p = store.write_payload(b"abc")
+    resp = Response.from_bytes(
+        request_id=req.id, status=ResponseStatus.OK, data=b"abc", path=str(p)
+    )
+    store.insert_response(resp)
+
+    cached = store.get_cached_response_by_request_hash(req.hash)
+    assert cached is not None and cached.id == resp.id
+
+
+def test_mark_session_ended_accepts_none(store: Store) -> None:
+    from mxm_dataio.models import Session
+
+    sess = Session(source="unit")
+    store.insert_session(sess)
+
+    store.mark_session_ended(sess.id, None)
+    with store.connect() as conn:
+        row = conn.execute(
+            "SELECT ended_at FROM sessions WHERE id=?", (sess.id,)
+        ).fetchone()
+    assert row is not None
+    assert row[0] is None

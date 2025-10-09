@@ -19,8 +19,9 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar, Generator
+from typing import Any, ClassVar, Generator, Optional
 
 from mxm_dataio.models import Request, Response, Session
 
@@ -143,7 +144,7 @@ class Store:
             )
 
     # ------------------------------------------------------------------ #
-    # Insert methods
+    # Session lifecycle
     # ------------------------------------------------------------------ #
 
     def insert_session(self, session: Session) -> None:
@@ -163,6 +164,15 @@ class Store:
                     session.started_at.isoformat(),
                     session.ended_at.isoformat() if session.ended_at else None,
                 ),
+            )
+
+    def mark_session_ended(self, session_id: str, ended_at: datetime | None) -> None:
+        """Set ended_at for a session."""
+        ts = ended_at.isoformat() if ended_at else None
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                (ts, session_id),
             )
 
     def insert_request(self, request: Request) -> None:
@@ -205,6 +215,50 @@ class Store:
                     response.created_at.isoformat(),
                     response.size_bytes,
                 ),
+            )
+
+    # --------------------------------------------------------------------- #
+    # Caching & lookup
+    # --------------------------------------------------------------------- #
+
+    def get_cached_response_by_request_hash(
+        self, request_hash: str
+    ) -> Optional["Response"]:
+        """Return the most recent Response for a previously-seen request hash, if any."""
+        with self.connect() as conn:
+            row_req = conn.execute(
+                "SELECT id FROM requests WHERE hash = ? ORDER BY created_at DESC LIMIT 1",
+                (request_hash,),
+            ).fetchone()
+            if row_req is None:
+                return None
+
+            row_resp = conn.execute(
+                """
+                SELECT id, request_id, status, sequence, checksum, path, created_at, size_bytes
+                FROM responses
+                WHERE request_id = ?
+                ORDER BY created_at DESC, COALESCE(sequence, -1) DESC
+                LIMIT 1
+                """,
+                (row_req[0],),
+            ).fetchone()
+
+            if row_resp is None:
+                return None
+
+            # Local import to avoid circular deps
+            from mxm_dataio.models import Response, ResponseStatus
+
+            return Response(
+                id=row_resp[0],
+                request_id=row_resp[1],
+                status=ResponseStatus(row_resp[2]),
+                sequence=row_resp[3],
+                checksum=row_resp[4],
+                path=row_resp[5],
+                created_at=datetime.fromisoformat(row_resp[6]),
+                size_bytes=row_resp[7],
             )
 
     # ------------------------------------------------------------------ #
