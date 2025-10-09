@@ -53,6 +53,7 @@ ${paths.data_root}/
 
 - **Protocol-agnostic & dependency-light**: stdlib only (sqlite3, pathlib, json, hashlib).
 - **Deterministic & auditable**: stable hashing, checksums, reproducible layout.
+- **Queryable & fast**: SQLite indexes on hot paths (`requests.hash`, `requests.session_id`, `responses.request_id`, `responses.created_at`, `responses.checksum`) for snappy cache lookups and listing.
 - **Separation of concerns**:
   - `mxm-dataio` archives raw bytes + provenance.
   - Domain packages parse/normalize into queryable schemas, while storing `response_id`/`checksum` for provenance.
@@ -78,7 +79,11 @@ class Fetcher(MXMDataIoAdapter, Protocol):
 
 @runtime_checkable
 class Sender(MXMDataIoAdapter, Protocol):
-    def send(self, request: Request, payload: bytes) -> dict[str, str]: ...
+    # DataIoSession.send accepts any of these:
+    # - bytes               (raw)
+    # - dict[str, Any]      (stored as deterministic JSON)
+    # - AdapterResult       (bytes + metadata sidecar)
+    def send(self, request: Request, payload: bytes) -> Any: ...
 
 @dataclass(slots=True)
 class AdapterResult:
@@ -131,6 +136,10 @@ with DataIoSession(source="justetf", cfg=cfg) as io:
 - **Capability checks** — `.fetch()` requires a `Fetcher` adapter; `.send()` requires a `Sender`. Raises `TypeError` otherwise.
 - **Caching** — enabled by default (`use_cache=True`). If a previous Request with the same `hash` exists, returns the most recent Response (no duplicate I/O).
 - **Sidecar metadata** — if an adapter returns `AdapterResult`, its `meta_dict()` is written to `responses/<checksum>.meta.json` (deterministic JSON, readable Unicode).
+
+**Store helpers** (used internally by `DataIoSession`):
+- `Store.mark_session_ended(session_id, ended_at)` — finalize session end time.
+- `Store.get_cached_response_by_request_hash(request_hash)` — return the latest cached `Response` for an identical Request.
 
 ## Configuration (via mxm-config)
 
@@ -254,12 +263,11 @@ assert resp2.id == resp1.id  # reused cached Response
 
 ## Roadmap
 
-- DB indexes in SQLite (`requests.hash`, `responses.request_id`) for scale.
-- Replay helpers in `Store` (`get_cached_response_by_hash`).
+- Replay helpers in `Store` (e.g., list/iterate responses by request; as-of replay).
+- CLI tools: list sessions/requests, inspect responses, dump payloads.
 - Migrations: schema versioning via a small `meta` table.
 - Compression / TTL: optional payload compression, retention policies.
 - Streaming: finalize `Streamer` as `AsyncIterator[bytes]`, persist sequenced frames.
-- CLI tools: list sessions/requests, inspect responses, dump payloads.
 - Reference adapters: `LocalFileFetcher`, minimal `HttpFetcher` (stdlib).
 
 ## Repository layout
@@ -297,5 +305,4 @@ config/
 - **mxm-refdata**: reconciliation logic; may replay past `Response`s by `as_of`.
 
 ## License
-
-TBD by repository (MIT/Apache-2.0 typically). Add the appropriate `LICENSE` file.
+MIT License. See [LICENSE](LICENSE).
