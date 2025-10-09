@@ -1,4 +1,9 @@
 # mxm-dataio
+![Version](https://img.shields.io/github/v/release/moneyexmachina/mxm-config)
+![License](https://img.shields.io/github/license/moneyexmachina/mxm-config)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
+[![Checked with pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+
 
 Unified ingestion, caching, and audit layer for the Money Ex Machina (MXM) ecosystem. `mxm-dataio` records every interaction with an external system—who/what/when, the exact bytes returned, and optional transport metadata—so downstream packages are reproducible and auditable.
 
