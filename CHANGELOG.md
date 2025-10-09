@@ -26,6 +26,13 @@ The format is based on **Keep a Changelog**, and this project adheres to **Seman
 
 ---
 
+## [0.1.1] - 2025-10-09
+
+### Changed
+- README: add CI/license badges and minor doc tweaks.
+- Bump version to 0.1.1.
+---
+
 ## [0.1.0] - 2025-10-09
 
 ### Added
