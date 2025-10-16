@@ -26,6 +26,17 @@ The format is based on **Keep a Changelog**, and this project adheres to **Seman
 
 ---
 
+## [0.1.2] - 2025-10-16
+
+### Changed
+- Relax dependency on **mxm-config** to `^0.2.2` so consumers can use the new `MXMConfig` protocol and `make_subconfig` helper.
+- Documentation: examples now show passing a minimal DataIO config via `make_subconfig(...)` at package boundaries.
+
+### Notes
+- No runtime behavior changes in DataIO; this is a compatibility/packaging bump to align with mxm-config ≥ 0.2.2.
+
+[0.1.2]: https://example.com/releases/tag/v0.1.2
+
 ## [0.1.1] - 2025-10-09
 
 ### Changed
