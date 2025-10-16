@@ -26,6 +26,10 @@ The format is based on **Keep a Changelog**, and this project adheres to **Seman
 
 ---
 
+## [0.1.3] - 2025-10-16
+### Changed
+- Pin mxm-config dependency by git **rev** (commit SHA) instead of tag to avoid dulwich/tag resolution issues.
+
 ## [0.1.2] - 2025-10-16
 
 ### Changed
