@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.1.1"
+version = "0.1.2"
 description = "**Unified ingestion, caching, and audit layer for the Money Ex Machina ecosystem.**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
@@ -8,7 +8,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.13"
-mxm-config = { git = "https://github.com/moneyexmachina/mxm-config.git", tag = "v0.2.2" }
+mxm-config = { git = "https://github.com/moneyexmachina/mxm-config.git", rev= "cd2d4066f28a49b992be111b51e44e0ed70c3f0f"}
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
