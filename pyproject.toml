@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.1.3"
+version = "0.1.4"
 description = "**Unified ingestion, caching, and audit layer for the Money Ex Machina ecosystem.**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
@@ -8,7 +8,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.13"
-mxm-config = { git = "https://github.com/moneyexmachina/mxm-config.git", rev= "cd2d4066f28a49b992be111b51e44e0ed70c3f0f"}
+mxm-config = ">=0.2.5,<0.3" 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -20,7 +20,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py313"
 # Select rulesets; expand gradually if desired
 select = ["E", "F", "B", "ANN"]
 ignore = ["ANN101", "ANN102"]
@@ -30,7 +30,7 @@ exclude = ["build", "dist", ".venv"]
 
 [tool.black]
 line-length = 88
-target-version = ["py312"]
+target-version = ["py313"]
 
 [tool.isort]
 profile = "black"
@@ -41,7 +41,7 @@ combine_as_imports = true
 typeCheckingMode = "strict"            # or "strict" if you want more enforcement
 include = ["mxm_dataio"]
 exclude = ["build", "dist", "docs", ".venv"]
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 pythonPlatform = "All"
 reportMissingImports = "error"
 reportMissingTypeStubs = "warning"
@@ -52,6 +52,7 @@ black = "^25.9.0"
 ruff = "^0.13.2"
 pytest = "^8.4.2"
 ipython = "^9.6.0"
+pyright = "^1.1.406"
 
 
 [tool.pytest.ini_options]

@@ -25,7 +25,26 @@ The format is based on **Keep a Changelog**, and this project adheres to **Seman
 - None.
 
 ---
+## [0.1.4] — 2025-10-19
+### Added
+- **GitHub Actions workflow** `.github/workflows/release.yml`  
+  Automates build and publication to **PyPI** when a new version tag is pushed.  
+  The workflow builds both wheel and sdist, verifies imports, and uploads securely using Poetry.
 
+### Changed
+- Updated dependency on **`mxm-config`** to use the latest official **PyPI release** (`>=0.2.5`).
+- Minor adjustments to project metadata to align with publishing standards.
+
+### Notes
+- This is the **first PyPI-published version** of `mxm-dataio`.  
+  No functional changes to the core package logic.
+- The internal dependency graph (`mxm-dataio` → `mxm-config`) now fully resolves from public releases.
+
+### Upgrade guidance
+No code changes are required.  
+You can install this version directly from PyPI:
+```bash
+pip install -U mxm-dataio
 ## [0.1.3] - 2025-10-16
 ### Changed
 - Pin mxm-config dependency by git **rev** (commit SHA) instead of tag to avoid dulwich/tag resolution issues.

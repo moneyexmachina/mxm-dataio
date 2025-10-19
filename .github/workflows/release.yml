@@ -1,0 +1,38 @@
+name: Publish to PyPI
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mxm-dataio/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: Build (uses poetry-core backend)
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          # ensure tag matches pyproject version
+          TAG="${GITHUB_REF_NAME#v}"
+          python - <<'PY' "$TAG"
+          import sys, tomllib
+          want = sys.argv[1]
+          with open("pyproject.toml", "rb") as f:
+              got = tomllib.load(f)["tool"]["poetry"]["version"]
+          assert want == got, f"Tag v{want} != pyproject {got}"
+          PY
+          python -m build
+          python -m twine check dist/* 
+      - name: Publish to PyPI via OIDC
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
