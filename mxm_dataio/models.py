@@ -16,8 +16,6 @@ The models are dependency-light, serializable, and future-proof for
 asynchronous or streaming communication patterns.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import uuid
@@ -161,7 +159,7 @@ class Response:
         data: bytes,
         path: str,
         sequence: int | None = None,
-    ) -> Response:
+    ) -> "Response":
         """Create a Response object from raw bytes."""
         checksum = hashlib.sha256(data).hexdigest()
         return cls(
@@ -173,8 +171,84 @@ class Response:
             size_bytes=len(data),
         )
 
+    @classmethod
+    def from_adapter_result(
+        cls,
+        request_id: str,
+        status: ResponseStatus,
+        result: "AdapterResult",
+        path: str,
+        sequence: int | None = None,
+    ) -> "Response":
+        """Create a Response from an AdapterResult (checksum/size derived from bytes)."""
+        return cls.from_bytes(
+            request_id=request_id,
+            status=status,
+            data=result.data,
+            path=path,
+            sequence=sequence,
+        )
+
     def verify(self, data: bytes) -> bool:
         """Return True if the given data matches the stored checksum."""
         if self.checksum is None:
             return False
         return hashlib.sha256(data).hexdigest() == self.checksum
+
+
+@dataclass(slots=True)
+class AdapterResult:
+    """Unified return envelope for adapters.
+
+    Adapters may return either:
+      • raw bytes (status quo), or
+      • an AdapterResult carrying bytes + transport metadata.
+
+    The `data` field contains the exact payload to persist under checksum.
+    All other fields are optional metadata that can be stored as a sidecar
+    JSON alongside the payload for inspection/replay.
+
+    Fields
+    ------
+    data:
+        Raw payload bytes from the external system (exact as received).
+    content_type:
+        MIME type if known (e.g., "application/json", "text/csv").
+    encoding:
+        Text encoding if applicable (e.g., "utf-8").
+    transport_status:
+        Transport-layer status code (e.g., HTTP status).
+    url:
+        Final request URL after redirects, if relevant.
+    elapsed_ms:
+        End-to-end elapsed time in milliseconds.
+    headers:
+        Flattened response headers (string-valued).
+    adapter_meta:
+        Free-form, source-specific metadata (rate limits, request id, etc.).
+    """
+
+    data: bytes
+    content_type: str | None = None
+    encoding: str | None = None
+    transport_status: int | None = None
+    url: str | None = None
+    elapsed_ms: int | None = None
+    headers: dict[str, str] | None = None
+    adapter_meta: dict[str, Any] | None = None
+
+    def meta_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable dict of all non-payload metadata."""
+        return {
+            k: v
+            for k, v in {
+                "content_type": self.content_type,
+                "encoding": self.encoding,
+                "transport_status": self.transport_status,
+                "url": self.url,
+                "elapsed_ms": self.elapsed_ms,
+                "headers": self.headers,
+                "adapter_meta": self.adapter_meta,
+            }.items()
+            if v is not None
+        }

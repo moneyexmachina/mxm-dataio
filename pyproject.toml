@@ -1,10 +1,13 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.1.4"
+version = "0.2.0"
 description = "**Unified ingestion, caching, and audit layer for the Money Ex Machina ecosystem.**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
 readme = "README.md"
+packages = [{ include = "mxm_dataio" }]
+include = ["mxm_dataio/py.typed"]
+classifiers = ["Typing :: Typed"]
 
 [tool.poetry.dependencies]
 python = "^3.13"

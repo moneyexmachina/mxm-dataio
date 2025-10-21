@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -12,21 +11,30 @@ import pytest
 
 from mxm_dataio.adapters import Fetcher, Sender
 from mxm_dataio.api import DataIoSession
-from mxm_dataio.models import Request, RequestMethod, ResponseStatus
+from mxm_dataio.models import AdapterResult, Request, RequestMethod, ResponseStatus
 from mxm_dataio.registry import clear_registry, register
 from mxm_dataio.store import Store
 
 # --------------------------------------------------------------------------- #
-# Dummy adapters
+# Dummy adapters (AdapterResult-based)
 # --------------------------------------------------------------------------- #
 
 
 class DummyFetcher(Fetcher):
     source = "dummy_fetch"
 
-    def fetch(self, request: Request) -> bytes:
+    def fetch(self, request: Request) -> AdapterResult:
         # Deterministic payload tied to request hash
-        return f"PAYLOAD:{request.hash}".encode("utf-8")
+        payload = f"PAYLOAD:{request.hash}".encode("utf-8")
+        return AdapterResult(
+            data=payload,
+            transport_status=200,
+            content_type="application/octet-stream",
+            url="https://dummy.fetch.local/resource",
+            elapsed_ms=5,
+            headers={"X-Dummy": "fetch"},
+            adapter_meta={"note": "dummy-fetch"},
+        )
 
     def describe(self) -> str:
         return "Dummy fetch adapter"
@@ -38,9 +46,18 @@ class DummyFetcher(Fetcher):
 class DummySender(Sender):
     source = "dummy_send"
 
-    def send(self, request: Request, payload: bytes) -> dict[str, str]:
+    def send(self, request: Request, payload: bytes) -> AdapterResult:
         _ = request
-        return {"ok": "1", "len": str(len(payload))}
+        # Echo the payload as the response 'data', and attach small metadata
+        return AdapterResult(
+            data=payload,
+            transport_status=200,
+            content_type="application/json",
+            url="https://dummy.send.local/resource",
+            elapsed_ms=7,
+            headers={"Content-Type": "application/json"},
+            adapter_meta={"ok": "1", "len": str(len(payload))},
+        )
 
     def describe(self) -> str:
         return "Dummy send adapter"
@@ -149,10 +166,18 @@ def test_send_persists_ack_and_json_payload(store_cfg: dict[str, Any]) -> None:
 
     assert resp.status == ResponseStatus.ACK
     assert resp.path is not None
-    payload = Path(resp.path).read_bytes()
-    meta = json.loads(payload.decode("utf-8"))
-    assert meta["ok"] == "1"
-    assert meta["len"] == str(len(b'{"hello":"world"}'))  # deterministic JSON encoder
+    assert resp.checksum is not None
+
+    # Payload on disk is the JSON we sent (deterministic encoder)
+    payload_bytes = Path(resp.path).read_bytes()
+    assert payload_bytes == b'{"hello":"world"}'
+
+    # Sidecar metadata exists and contains adapter meta + content type
+    store = Store.get_instance(store_cfg)
+    meta = store.read_metadata(resp.checksum)
+    assert meta["content_type"] == "application/json"
+    assert meta["adapter_meta"]["ok"] == "1"
+    assert meta["adapter_meta"]["len"] == str(len(b'{"hello":"world"}'))
 
 
 def test_capability_mismatch_raises(store_cfg: dict[str, Any]) -> None:

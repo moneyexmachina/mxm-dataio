@@ -5,35 +5,38 @@ connect the MXM DataIO layer to external systems. Adapters translate between
 the generic Request/Response model used internally and the specific protocols
 used by each data source, broker, or stream.
 
-Every adapter must inherit from :class:`MXMDataIoAdapter` and may additionally
+Every adapter must satisfy :class:`MXMDataIoAdapter` and may additionally
 implement one or more capability interfaces such as :class:`Fetcher`,
 :class:`Sender`, or :class:`Streamer`.
 
+Return semantics
+----------------
+All **synchronous** adapter operations return a metadata-rich
+:class:`AdapterResult`. This replaces the historic "bytes only" return and
+enables robust auditing (status, headers, URL, content-type, elapsed).
+
+For **streaming**, adapters should expose an *async iterator* that yields
+:class:`AdapterResult` chunks. This preserves transport metadata per message.
+
 Example
 -------
-    from mxm_dataio.adapters import Fetcher
+    from mxm_dataio.adapters import Fetcher, AdapterResult
     from mxm_dataio.models import Request
 
     class JustETFFetcher:
         source = "justetf"
 
-        def fetch(self, request: Request) -> bytes:
-            # perform HTTP GET and return raw bytes
+        def fetch(self, request: Request) -> AdapterResult:
+            # perform HTTP GET and return bytes + metadata
             ...
 
-        def describe(self) -> str:
-            return "Fetch ETF data from JustETF"
-
-        def close(self) -> None:
-            pass
+        def describe(self) -> str: ...
+        def close(self) -> None: ...
 """
 
-from __future__ import annotations
+from typing import AsyncIterator, Protocol, runtime_checkable
 
-from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
-
-from mxm_dataio.models import Request
+from mxm_dataio.models import AdapterResult, Request
 
 
 @runtime_checkable
@@ -64,14 +67,14 @@ class MXMDataIoAdapter(Protocol):
 
 @runtime_checkable
 class Fetcher(MXMDataIoAdapter, Protocol):
-    """Capability interface for adapters that can fetch data.
+    """Capability interface for adapters that fetch data (e.g., HTTP GET).
 
-    Implementations should perform the necessary I/O to retrieve external data
-    and return the raw bytes of the response.
+    Implementations perform I/O to retrieve external data and must return an
+    :class:`AdapterResult` containing the raw payload and transport metadata.
     """
 
-    def fetch(self, request: Request) -> bytes:
-        """Perform the external I/O and return raw response bytes."""
+    def fetch(self, request: Request) -> AdapterResult:
+        """Execute the request and return a metadata-rich result."""
         ...
 
 
@@ -79,73 +82,19 @@ class Fetcher(MXMDataIoAdapter, Protocol):
 class Sender(MXMDataIoAdapter, Protocol):
     """Capability interface for adapters that can send or post data."""
 
-    def send(self, request: Request, payload: bytes) -> dict[str, str]:
-        """Send or post data to an external system and return a metadata map."""
+    def send(self, request: Request, payload: bytes) -> AdapterResult:
+        """Send or post data and return a metadata-rich result."""
         ...
 
 
 @runtime_checkable
 class Streamer(MXMDataIoAdapter, Protocol):
-    """Capability interface for adapters that can stream data asynchronously."""
+    """Capability interface for adapters that produce asynchronous streams.
 
-    async def stream(self, request: Request) -> None:
-        """Subscribe to a continuous data stream."""
-        ...
-
-
-@dataclass(slots=True)
-class AdapterResult:
-    """Unified return envelope for adapters.
-
-    Adapters may return either:
-      • raw bytes (status quo), or
-      • an AdapterResult carrying bytes + transport metadata.
-
-    The `data` field contains the exact payload to persist under checksum.
-    All other fields are optional metadata that can be stored as a sidecar
-    JSON alongside the payload for inspection/replay.
-
-    Fields
-    ------
-    data:
-        Raw payload bytes from the external system (exact as received).
-    content_type:
-        MIME type if known (e.g., "application/json", "text/csv").
-    encoding:
-        Text encoding if applicable (e.g., "utf-8").
-    transport_status:
-        Transport-layer status code (e.g., HTTP status).
-    url:
-        Final request URL after redirects, if relevant.
-    elapsed_ms:
-        End-to-end elapsed time in milliseconds.
-    headers:
-        Flattened response headers (string-valued).
-    adapter_meta:
-        Free-form, source-specific metadata (rate limits, request id, etc.).
+    Implementations should yield :class:`AdapterResult` items, one per message/
+    event/chunk, preserving transport metadata alongside payload bytes.
     """
 
-    data: bytes
-    content_type: str | None = None
-    encoding: str | None = None
-    transport_status: int | None = None
-    url: str | None = None
-    elapsed_ms: int | None = None
-    headers: dict[str, str] | None = None
-    adapter_meta: dict[str, Any] | None = None
-
-    def meta_dict(self) -> dict[str, Any]:
-        """Return a JSON-serializable dict of all non-payload metadata."""
-        return {
-            k: v
-            for k, v in {
-                "content_type": self.content_type,
-                "encoding": self.encoding,
-                "transport_status": self.transport_status,
-                "url": self.url,
-                "elapsed_ms": self.elapsed_ms,
-                "headers": self.headers,
-                "adapter_meta": self.adapter_meta,
-            }.items()
-            if v is not None
-        }
+    async def stream(self, request: Request) -> AsyncIterator[AdapterResult]:
+        """Yield a sequence of results for the given subscription/request."""
+        ...

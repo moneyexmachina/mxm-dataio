@@ -25,6 +25,73 @@ The format is based on **Keep a Changelog**, and this project adheres to **Seman
 - None.
 
 ---
+
+## [0.2.0] — 2025-10-21
+
+### Added
+- **`py.typed` marker** to declare the package as type-checked and fully typed for downstream consumers.
+- Comprehensive **Pyright coverage** across all modules (`models.py`, `adapters.py`, `api.py`, and `store.py`).
+- Extended test coverage for `AdapterResult` metadata persistence:
+  - `.meta.json` sidecars (content type, headers, transport metadata).
+  - Cache idempotence and deterministic persistence validation.
+
+### Changed
+- **Unified adapter protocol**:  
+  All adapter capabilities (`Fetcher`, `Sender`, `Streamer`) now return a single, rich data envelope:
+  ```python
+  AdapterResult(data: bytes, *, content_type=None, encoding=None,
+                transport_status=None, url=None, elapsed_ms=None,
+                headers=None, adapter_meta=None)
+  ```
+  replacing the former `bytes | dict` behavior.  
+  Adapters must now explicitly return `AdapterResult` objects.
+
+- **Refactored `DataIoSession`** for uniform persistence:  
+  - Always writes payloads as `.bin` files and sidecar metadata as `.meta.json`.  
+  - Simplified and unified caching logic.  
+  - `fetch()` and `send()` now share a common adapter-result handling path.
+
+- **Improved type precision and clarity** in `store.py`:  
+  - `_instances` properly annotated (`dict[str, Store]`).  
+  - `get_instance()` explicitly returns `Store`.  
+  - Removed all Pyright “unknown” and “partially typed” errors.
+
+### Deprecated
+- None.
+
+### Removed
+- Support for raw-bytes adapter returns (`fetch() -> bytes`)  
+  and mapping-returns (`send() -> dict`).  
+  These are replaced by the new, strictly-typed `AdapterResult` interface.
+
+### Fixed
+- Eliminated all Pyright warnings and type-inference issues across the codebase.  
+- Resolved circular import risk between `adapters` and `models` by relocating `AdapterResult` to `models.py`.
+
+### Notes
+- **Breaking change:** Adapters returning raw `bytes` are no longer supported.  
+  Implement `AdapterResult` return values for full compatibility.
+- The new protocol ensures all I/O operations are **deterministic, auditable, and replayable**.  
+  Each persisted response now has:
+  - A binary payload (`<checksum>.bin`)
+  - A JSON sidecar (`<checksum>.meta.json`)
+- Tests confirm identical cache semantics and integrity of persisted sessions.
+
+### Upgrade guidance
+To migrate:
+1. Update custom adapters to return an `AdapterResult` instead of raw bytes.  
+   Example:
+   ```python
+   from mxm_dataio.models import AdapterResult
+   return AdapterResult(data=response_bytes, content_type="application/json")
+   ```
+2. No changes needed for consumers of `DataIoSession` or `Store`.
+3. After upgrading, run `pytest` and `pyright` to confirm compliance.
+
+---
+
+[0.2.0]: https://example.com/releases/tag/v0.2.0
+
 ## [0.1.4] — 2025-10-19
 ### Added
 - **GitHub Actions workflow** `.github/workflows/release.yml`  

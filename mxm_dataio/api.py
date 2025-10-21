@@ -10,23 +10,25 @@ Responsibilities
 - Construct deterministic Requests (models.Request)
 - Resolve the correct adapter via the registry (by source name)
 - Dispatch to adapter capabilities (Fetcher / Sender)
-- Persist Responses and raw payloads (checksum-verified)
+- Persist AdapterResults: payload bytes (checksum-verified) + sidecar metadata
 - Optional request-hash caching to avoid duplicate work
 
 Notes
 -----
-* Streaming is intentionally left as a future extension; the method
-  is defined with a clear exception for now (see TODO).
+* Streaming is intentionally left as a future extension; the method is defined
+  with a clear exception for now (see TODO).
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Optional, Type
 
-from mxm_dataio.adapters import AdapterResult, Fetcher, Sender
+from mxm_dataio.adapters import Fetcher, Sender
 from mxm_dataio.models import (
+    AdapterResult,
     Request,
     RequestMethod,
     Response,
@@ -97,9 +99,7 @@ class DataIoSession:
         exc_tb: Optional[TracebackType],
     ) -> None:
         """Finalize the Session by setting ended_at."""
-
         _ = (exc_type, exc_val, exc_tb)
-
         if self._session is None:
             return
         self._session.end()
@@ -147,31 +147,18 @@ class DataIoSession:
             if cached is not None:
                 return cached
 
-        result = adapter.fetch(request)  # bytes | AdapterResult
-        data, meta = _extract_bytes_and_meta(result)
-        path = self.store.write_payload(data)
-        # Write sidecar metadata (if any)
-        if meta:
-            self.store.write_metadata(path.stem, meta)
-
-        resp = Response.from_bytes(
+        result: AdapterResult = adapter.fetch(request)
+        resp = persist_result_as_response(
+            store=self.store,
             request_id=request.id,
             status=ResponseStatus.OK,
-            data=data,
-            path=str(path),
-            sequence=None,
+            result=result,
         )
         self.store.insert_response(resp)
         return resp
 
     def send(self, request: Request, payload: bytes | dict[str, Any]) -> Response:
-        """Perform a send via a Sender-capable adapter and persist the Response.
-
-        Supports adapters returning:
-          - AdapterResult (data+meta)
-          - bytes (raw)
-          - dict (treated as JSON body and stored as payload)
-        """
+        """Perform a send via a Sender-capable adapter and persist the Response."""
         adapter = resolve_adapter(self.source)
         if not isinstance(adapter, Sender):
             raise TypeError(f"Adapter '{self.source}' does not support sending.")
@@ -182,32 +169,12 @@ class DataIoSession:
                 return cached
 
         payload_bytes = _ensure_bytes(payload)
-        result = adapter.send(
-            request, payload_bytes
-        )  # AdapterResult | bytes | dict[str, Any]
-
-        # Normalize result to bytes + optional meta
-        if isinstance(result, AdapterResult):
-            data, meta = result.data, result.meta_dict()
-        elif isinstance(result, (bytes, bytearray, memoryview)):
-            data, meta = bytes(result), None
-        else:
-            # Assume mapping metadata; persist as deterministic JSON payload (status quo).
-            data = json.dumps(result, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-            meta = None
-
-        path = self.store.write_payload(data)
-        if meta:
-            self.store.write_metadata(path.stem, meta)
-
-        resp = Response.from_bytes(
+        result: AdapterResult = adapter.send(request, payload_bytes)
+        resp = persist_result_as_response(
+            store=self.store,
             request_id=request.id,
             status=ResponseStatus.ACK,
-            data=data,
-            path=str(path),
-            sequence=None,
+            result=result,
         )
         self.store.insert_response(resp)
         return resp
@@ -215,8 +182,8 @@ class DataIoSession:
     async def stream(self, request: Request) -> None:
         """(Planned) Perform streaming via a Streamer-capable adapter.
 
-        TODO: Define Streamer to return an async iterator of bytes so we can
-        iterate messages and persist them as sequenced Responses.
+        TODO: Define Streamer to return an async iterator of AdapterResult so we
+        can iterate messages and persist them as sequenced Responses.
         """
         _ = request
         raise NotImplementedError(
@@ -237,14 +204,33 @@ class DataIoSession:
 # --------------------------------------------------------------------------- #
 
 
-def _extract_bytes_and_meta(
-    obj: bytes | AdapterResult,
-) -> tuple[bytes, dict[str, Any] | None]:
-    """Normalize adapter returns to (bytes, optional_metadata)."""
-    if isinstance(obj, AdapterResult):
-        return obj.data, obj.meta_dict()
-    # By type hint, anything else here is bytes.
-    return obj, None
+def persist_result_as_response(
+    *,
+    store: "Store",
+    request_id: str,
+    status: ResponseStatus,
+    result: AdapterResult,
+    sequence: int | None = None,
+) -> Response:
+    """Persist an AdapterResult (bytes + metadata) and return a Response row.
+
+    - Writes payload bytes to the store (checksum path).
+    - Writes sidecar metadata if present (result.meta_dict()).
+    - Builds a Response via Response.from_adapter_result (checksum + size).
+    """
+    path = store.write_payload(result.data)  # Path-like or str
+    meta = result.meta_dict()
+    if meta:
+        stem = Path(path).stem if hasattr(path, "stem") else Path(str(path)).stem
+        store.write_metadata(stem, meta)
+
+    return Response.from_adapter_result(
+        request_id=request_id,
+        status=status,
+        result=result,
+        path=str(path),
+        sequence=sequence,
+    )
 
 
 def _ensure_bytes(payload: bytes | dict[str, Any]) -> bytes:

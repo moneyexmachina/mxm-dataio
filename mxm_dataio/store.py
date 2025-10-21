@@ -38,7 +38,7 @@ class Store:
     path) has at most one Store instance per process.
     """
 
-    _instances: ClassVar[dict[str, Store]] = {}
+    _instances: ClassVar[dict[str, "Store"]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, cfg: dict[str, Any]):
@@ -58,7 +58,7 @@ class Store:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get_instance(cls, cfg: dict[str, Any]) -> Store:
+    def get_instance(cls, cfg: dict[str, Any]) -> "Store":
         """Return the singleton Store for the given configuration."""
         db_key = str(cfg["paths"]["db_path"])
         with cls._lock:
