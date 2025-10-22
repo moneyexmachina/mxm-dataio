@@ -4,27 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
-## [Unreleased]
+## [0.2.1] – 2025-10-22
 
 ### Added
-- CLI (planned for v0.2.0): inspect sessions/requests/responses, show metadata, dump payloads.
-- Convenience store helpers (planned): `get_payload_and_metadata`, `has_metadata`.
-- Reference adapters (planned): `LocalFileFetcher`, minimal stdlib `HttpFetcher`.
-- Streaming design (planned): `Streamer.stream(request) -> AsyncIterator[bytes]` and sequenced persistence.
+- Introduced **`make_view()`** helper in `mxm-config` for creating typed, read-only sub-config views of the global MXM configuration tree.  
+  Enables downstream packages to obtain focused configuration scopes (`mxm_dataio`, `mxm_dataraken`, etc.) via `mxm_config.make_view(cfg, "mxm_dataio")`.
+- Added package-specific view helpers to `mxm-dataio`:
+  - `dataio_view(cfg)` – returns the full `mxm_dataio` subtree.
+  - `dataio_paths_view(cfg)` – returns the `mxm_dataio.paths` view.
+  - `dataio_http_view(cfg)` – returns the `mxm_dataio.http` view.
+- New hermetic test suite verifying correct YAML loading via local `MXM_CONFIG_HOME`
+  and validating all view helpers with `pyright` and `pytest`.
 
 ### Changed
-- TBD based on feedback from `mxm-datakraken` JustETF integration.
-
-### Deprecated
-- None.
-
-### Removed
-- None.
+- Simplified `mxm_dataio/config/config.py` to remove implicit auto-loading and rely on explicit `load_config()` and view helpers.
+- Updated default configuration YAMLs to the unified **package-subtree layout** (`mxm_dataio:` block under top level).
+- Rewrote `README.md` for clarity, shortening and aligning documentation style with current MXM standards.
 
 ### Fixed
-- None.
-
----
+- Ensured all tests run without dependence on globally installed configs.
+- Verified full `pyright`, `ruff`, and `black` compliance.
 
 ## [0.2.0] — 2025-10-21
 

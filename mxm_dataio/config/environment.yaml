@@ -5,6 +5,14 @@
 # and storage behaviour (none yet).
 # ==============================================
 
-dev: {}
+dev:
+  mxm_dataio:
+    http.politeness_ms: 500
+    cache.use_cache: true
+    cache.force_refresh: false
 
-prod: {}
+prod:
+  mxm_dataio:
+    http.politeness_ms: 1500
+    cache.use_cache: true
+    cache.force_refresh: false

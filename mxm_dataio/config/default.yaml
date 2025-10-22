@@ -6,13 +6,48 @@
 # ==============================================
 
 paths:
-  # Fully resolved data root, composed from machine.yaml’s
-  # data_root_base, plus env and profile.
   data_root: ${paths.data_root_base}/${mxm_env}/dataio/${mxm_profile}
   db_path: ${paths.data_root}/dataio.sqlite
   responses_dir: ${paths.data_root}/responses
+  blobs_dir: ${paths.data_root}/blobs
+  tmp_dir: ${paths.data_root}/tmp
 
-  # (Future extension points)
-  # etf: ${paths.data_root}/etf
-  # futures: ${paths.data_root}/futures
-  # events: ${paths.data_root}/events
+mxm_dataio:
+  paths:
+    root: ${paths.data_root}
+    db_path: ${paths.db_path}
+    responses_dir: ${paths.responses_dir}
+    blobs_dir: ${paths.blobs_dir}
+    tmp_dir: ${paths.tmp_dir}
+  store:
+    sqlite:
+      pragmas:
+        journal_mode: WAL
+        synchronous: NORMAL
+        cache_size: -20000
+      vacuum_on_close: false
+  serialization:
+    response_format: raw
+    compression: none
+    hash_algo: sha256
+  audit:
+    record_request: true
+    record_response: true
+    record_parse_log: true
+    redact_headers: ["Authorization", "Cookie"]
+    max_payload_bytes: 5242880
+  http:
+    timeout_s: 20.0
+    retries: { max_attempts: 3, backoff_ms: [500, 1000, 2000] }
+    politeness_ms: 1000
+    verify_ssl: true
+    headers:
+      User-Agent: mxm-dataio/0.2 (+contact@moneyexmachina.com)
+  concurrency:
+    workers: 8
+  cache:
+    use_cache: true
+    write_cache: true
+    force_refresh: false
+  safety:
+    respect_robots: true

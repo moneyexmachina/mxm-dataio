@@ -6,11 +6,17 @@
 # the same environment.
 # ==============================================
 
-profiles:
-  default:
-    description: "Standard configuration for interactive or scheduled runs."
-  offline:
-    description: "Run without accessing external data sources."
-  test:
-    description: "Lightweight setup for unit testing."
+default:
+  mxm_dataio: {}
+
+offline:
+  mxm_dataio:
+    cache: { use_cache: true, write_cache: false, force_refresh: false }
+    http.timeout_s: 0.1
+
+test:
+  mxm_dataio:
+    audit.record_parse_log: false
+    cache: { use_cache: true, write_cache: false }
+    concurrency.workers: 2
 
