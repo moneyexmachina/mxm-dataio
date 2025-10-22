@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
+from mxm_config import MXMConfig, make_subconfig
 
 from mxm_dataio.store import Store
 
@@ -16,19 +16,24 @@ from mxm_dataio.store import Store
 
 
 @pytest.fixture()
-def store_cfg(tmp_path: Path) -> dict[str, Any]:
-    return {
-        "paths": {
-            "data_root": str(tmp_path),
-            "db_path": str(tmp_path / "dataio.sqlite"),
-            "responses_dir": str(tmp_path / "responses"),
+def store_cfg_view(tmp_path: Path) -> MXMConfig:
+    """
+    Provide a temporary **dataio view** with only the paths Store needs.
+    """
+    return make_subconfig(
+        {
+            "paths": {
+                "root": str(tmp_path),
+                "db_path": str(tmp_path / "dataio.sqlite"),
+                "responses_dir": str(tmp_path / "responses"),
+            }
         }
-    }
+    )
 
 
 @pytest.fixture()
-def store(store_cfg: dict[str, Any]) -> Store:
-    return Store.get_instance(store_cfg)
+def store(store_cfg_view: MXMConfig) -> Store:
+    return Store.get_instance(store_cfg_view)
 
 
 # --------------------------------------------------------------------------- #

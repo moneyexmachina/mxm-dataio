@@ -26,6 +26,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Optional, Type
 
+from mxm_config import MXMConfig
+
 from mxm_dataio.adapters import Fetcher, Sender
 from mxm_dataio.models import (
     AdapterResult,
@@ -53,7 +55,7 @@ class DataIoSession:
     source:
         The registry name of the external system (e.g., "justetf", "ibkr").
     cfg:
-        Resolved configuration dict (from mxm-config) providing paths.
+        Configuration dict (from mxm-config) providing paths.
     store:
         Optional pre-initialised Store. If omitted, a per-config singleton
         instance is retrieved.
@@ -67,17 +69,24 @@ class DataIoSession:
     def __init__(
         self,
         source: str,
-        cfg: dict[str, Any],
+        cfg: MXMConfig,
         *,
         store: Optional[Store] = None,
         mode: SessionMode = SessionMode.SYNC,
-        use_cache: bool = True,
+        use_cache: Optional[bool] = None,
     ) -> None:
         self.source = source
         self.cfg = cfg
         self.store = store or Store.get_instance(cfg)
         self.mode = mode
-        self.use_cache = use_cache
+        # Default cache behavior: cfg.cache.use_cache if present, else True
+        if use_cache is None:
+            try:
+                self.use_cache = bool(cfg.cache.use_cache)  # type: ignore[attr-defined]
+            except Exception:
+                self.use_cache = True
+        else:
+            self.use_cache = bool(use_cache)
 
         self._session: Optional[Session] = None
 

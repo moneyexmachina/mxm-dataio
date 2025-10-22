@@ -1,4 +1,5 @@
-"""Tests for mxm_dataio.store.
+"""
+Tests for mxm_dataio.store.
 
 Covers schema creation, idempotent inserts, transaction handling,
 payload I/O, and linkage between Session, Request, and Response.
@@ -8,9 +9,10 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 import pytest
+from mxm_config import MXMConfig, make_subconfig
 
 from mxm_dataio.models import Request, Response, ResponseStatus, Session
 from mxm_dataio.store import Store
@@ -21,21 +23,33 @@ from mxm_dataio.store import Store
 
 
 @pytest.fixture()
-def store_cfg(tmp_path: Path) -> dict[str, Any]:
-    """Provide a temporary config dictionary for testing."""
-    return {
-        "paths": {
-            "data_root": str(tmp_path),
-            "db_path": str(tmp_path / "test.sqlite"),
-            "responses_dir": str(tmp_path / "responses"),
+def store_cfg_view(tmp_path: Path) -> MXMConfig:
+    """
+    Provide a temporary **dataio view** (MXMConfig) for testing.
+
+    Shape:
+          paths:
+            root, db_path, responses_dir
+
+    We return the *view* rooted at `dataio`, exactly what Store expects.
+    """
+    cfg = make_subconfig(
+        {
+            "paths": {
+                "root": str(tmp_path),
+                "db_path": str(tmp_path / "test.sqlite"),
+                "responses_dir": str(tmp_path / "responses"),
+            }
         }
-    }
+    )
+    # Return the dataio subtree as the view
+    return cfg
 
 
 @pytest.fixture()
-def store(store_cfg: dict[str, Any]) -> Store:
-    """Return a new Store instance for the temporary config."""
-    return Store(store_cfg)
+def store(store_cfg_view: MXMConfig) -> Store:
+    """Return a new Store instance initialized from the dataio view."""
+    return Store(store_cfg_view)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,19 +135,27 @@ def test_transaction_rollback(store: Store) -> None:
     assert rows == []
 
 
-def test_get_instance_singleton(store_cfg: dict[str, Any]) -> None:
-    """Store.get_instance should return the same object for same config."""
-    s1 = Store.get_instance(store_cfg)
-    s2 = Store.get_instance(store_cfg)
+def test_get_instance_singleton(store_cfg_view: MXMConfig, tmp_path: Path) -> None:
+    """Store.get_instance should return the same object for same db path key."""
+    s1 = Store.get_instance(store_cfg_view)
+    s2 = Store.get_instance(store_cfg_view)
     assert s1 is s2
 
-    other_cfg = {
-        "paths": {
-            **store_cfg["paths"],
-            "db_path": str(Path(store_cfg["paths"]["data_root"]) / "other.sqlite"),
+    # Create a second view with a different db_path → should yield a different singleton
+    other_cfg = make_subconfig(
+        {
+            "dataio": {
+                "paths": {
+                    "root": str(Path(store_cfg_view.paths.root)),  # type: ignore[attr-defined]
+                    "db_path": str(Path(store_cfg_view.paths.root) / "other.sqlite"),  # type: ignore[attr-defined]
+                    "responses_dir": str(Path(store_cfg_view.paths.root) / "responses"),  # type: ignore[attr-defined]
+                }
+            }
         }
-    }
-    s3 = Store.get_instance(other_cfg)
+    )
+    other_view = cast(MXMConfig, other_cfg.dataio)  # type: ignore[attr-defined]
+
+    s3 = Store.get_instance(other_view)
     assert s3 is not s1
 
 

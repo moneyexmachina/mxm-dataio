@@ -21,7 +21,9 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar, Generator, Optional
+from typing import Any, ClassVar, Final, Generator, Optional
+
+from mxm_config import MXMConfig
 
 from mxm_dataio.models import Request, Response, Session
 
@@ -36,21 +38,48 @@ class Store:
     A Store instance is tied to a specific MXM configuration, resolved
     from mxm-config.  Each configuration (identified by its database
     path) has at most one Store instance per process.
+
+    Expects a **dataio** view as cfg. Reads only:
+
+        cfg.paths.root            (required)
+        cfg.paths.db_path         (optional)
+        cfg.paths.responses_dir   (optional)
+
+    Everything else in the view is ignored here.
     """
 
     _instances: ClassVar[dict[str, "Store"]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: MXMConfig):
         """Initialize the Store from a resolved configuration object."""
-        paths = cfg["paths"]
-        self.data_root = Path(paths["data_root"])
-        self.db_path = Path(paths.get("db_path", self.data_root / "dataio.sqlite"))
-        self.responses_dir = Path(
-            paths.get("responses_dir", self.data_root / "responses")
-        )
 
+        # Required: paths.root
+        try:
+            root = cfg.paths.root  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise ValueError(
+                "dataio.paths.root is required on the passed config view"
+            ) from exc
+        self.data_root = Path(str(root))
+
+        # Optional with defaults
+        try:
+            db_path = cfg.paths.db_path  # type: ignore[attr-defined]
+        except Exception:
+            db_path = self.data_root / "dataio.sqlite"
+        self.db_path = Path(str(db_path))
+
+        try:
+            responses_dir = cfg.paths.responses_dir  # type: ignore[attr-defined]
+        except Exception:
+            responses_dir = self.data_root / "responses"
+        self.responses_dir = Path(str(responses_dir))
         self.responses_dir.mkdir(parents=True, exist_ok=True)
+
+        # Keep the view for other components that may need further knobs
+        self.cfg = cfg
+
         self._ensure_schema()
 
     # ------------------------------------------------------------------ #
@@ -58,13 +87,31 @@ class Store:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get_instance(cls, cfg: dict[str, Any]) -> "Store":
-        """Return the singleton Store for the given configuration."""
-        db_key = str(cfg["paths"]["db_path"])
+    def get_instance(cls, cfg: MXMConfig) -> "Store":
+        """
+        Return the singleton Store for the given dataio view.
+
+        Keyed by the (normalized) DB path. Uses the same fallback as __init__:
+          - db_path := cfg.paths.db_path
+          - else     cfg.paths.root / "dataio.sqlite"
+        """
+        # Compute db_path with the same semantics as __init__
+        try:
+            db_path = Path(str(cfg.paths.db_path))  # type: ignore[attr-defined]
+        except Exception:
+            root = Path(str(cfg.paths.root))  # type: ignore[attr-defined]
+            db_path = root / "dataio.sqlite"
+
+        # Normalize for a stable key (no FS requirement)
+        # expanduser to unify ~; resolve(strict=False) to collapse .. without touching FS
+        key: Final[str] = db_path.expanduser().resolve(strict=False).as_posix()
+
         with cls._lock:
-            if db_key not in cls._instances:
-                cls._instances[db_key] = cls(cfg)
-            return cls._instances[db_key]
+            inst = cls._instances.get(key)
+            if inst is None:
+                inst = cls(cfg)
+                cls._instances[key] = inst
+            return inst
 
     # ------------------------------------------------------------------ #
     # Database connection context

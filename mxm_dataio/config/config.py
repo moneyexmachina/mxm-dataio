@@ -32,22 +32,10 @@ from mxm_config import MXMConfig, make_view
 
 
 def dataio_view(cfg: MXMConfig, *, resolve: bool = True) -> MXMConfig:
-    """Return the `mxm_dataio` subtree (read-only view)."""
-    return make_view(cfg, "mxm_dataio", resolve=resolve)
-
-
-def dataio_paths_view(cfg: MXMConfig, *, resolve: bool = True) -> MXMConfig:
-    """Return the `mxm_dataio.paths` subtree (filesystem layout)."""
-    return make_view(cfg, "mxm_dataio.paths", resolve=resolve)
-
-
-def dataio_http_view(cfg: MXMConfig, *, resolve: bool = True) -> MXMConfig:
-    """Return the `mxm_dataio.http` subtree (HTTP defaults & policy)."""
-    return make_view(cfg, "mxm_dataio.http", resolve=resolve)
+    """Return the `dataio` subtree (read-only view)."""
+    return make_view(cfg, "dataio", resolve=resolve)
 
 
 __all__ = [
     "dataio_view",
-    "dataio_paths_view",
-    "dataio_http_view",
 ]

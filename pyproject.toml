@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.2.1"
+version = "0.2.2"
 description = "**Unified ingestion, caching, and audit layer Money Ex Machina**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"

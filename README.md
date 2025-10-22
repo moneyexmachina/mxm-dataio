@@ -56,76 +56,46 @@ Raw bytes and parsed metadata are stored under:
 The main entry point for ingestion or submission tasks.
 
 ```python
-from mxm_dataio import DataIoSession
+from mxm_dataio.api import DataIoSession
 from mxm_dataio.adapters import HttpFetcher
 from mxm_config import load_config
-from mxm_dataio.config import dataio_view
+from mxm_dataio.config.config import dataio_view
 
 cfg = load_config(package="mxm-dataio", env="dev", profile="default")
 dio_cfg = dataio_view(cfg)
 
-session = DataIoSession(cfg=dio_cfg)
+# Register an adapter under a source name
+register("http", HttpFetcher())  # implements Fetcher
 
-fetcher = HttpFetcher()
-result = session.fetch("https://httpbin.org/get", fetcher)
-print(result.status_code, len(result.payload))
+# Use the session with that source name
+with DataIoSession(source="http", cfg=dio_cfg) as io:
+    req = io.request(kind="demo", params={"q": "mxm"})
+    resp = io.fetch(req)
+    print(resp.status, resp.checksum, resp.path)
+
 ```
 
 `AdapterResult` objects contain both the raw payload and normalized metadata:
 ```python
+
 from typing import Any
 
 class AdapterResult:
-    payload: bytes | str
-    meta: dict[str, Any]
+    data: bytes
     content_type: str | None
-    status_code: int | None
+    transport_status: int | None
+    url: str | None
+    elapsed_ms: int | None
+    headers: dict[str, str] | None
+    adapter_meta: dict[str, Any] | None
 ```
 
 ## Configuration
 
-`mxm-dataio` reads its settings from the **`mxm_dataio` subtree**
+`mxm-dataio` reads its settings from the **`dataio` subtree**
 of the global MXM config. Downstream packages obtain read-only
 views via `mxm_config.make_view`.
 
-### YAML shape
-
-```yaml
-# central paths (shared across packages)
-paths:
-  data_root: ${paths.data_root_base}/${mxm_env}/dataio/${mxm_profile}
-
-# mxm-dataio-specific subtree
-mxm_dataio:
-  paths:
-    root: ${paths.data_root}
-    db_path: ${paths.data_root}/dataio.sqlite
-  http:
-    timeout_s: 20.0
-    retries: { max_attempts: 3, backoff_ms: [500,1000,2000] }
-    politeness_ms: 1000
-    verify_ssl: true
-    headers: { User-Agent: mxm-dataio/0.3 (+contact@moneyexmachina.com) }
-  cache: { use_cache: true, write_cache: true, force_refresh: false }
-  serialization: { response_format: raw, compression: none, hash_algo: sha256 }
-  audit: { record_request: true, record_response: true, record_parse_log: true }
-```
-
-### View helpers
-
-```python
-from mxm_dataio.config import (
-    dataio_view,        # full subtree
-    dataio_paths_view,  # mxm_dataio.paths
-    dataio_http_view,   # mxm_dataio.http
-)
-
-dio = dataio_view(cfg)
-root = dataio_paths_view(cfg).root
-timeout = dataio_http_view(cfg).timeout_s
-```
-
-Views are **read-only** and safe to share between modules.
 
 ## Adapters
 

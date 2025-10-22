@@ -12,22 +12,37 @@ from _pytest.monkeypatch import MonkeyPatch  # type: ignore[import-not-found]
 
 def _mirror_pkg_config(
     tmp_root: Path,
-    package_name: str,
-    package_module: str,
+    package_name: str,  # e.g. "mxm-dataio"  (hyphen)
+    package_module: str,  # e.g. "mxm_dataio"  (underscore)
     package_config_rel: str = "config",
 ) -> Path:
     """
-    Create MXM_CONFIG_HOME/<package_name>/ that mirrors the package's config directory.
-    Prefer a symlink; fall back to copying if symlink fails (e.g., Windows without perms).
+    Create MXM_CONFIG_HOME/<package_name>/ by mirroring YAMLs from this repo.
+
+    Preferred source:
+        <repo_root>/<package_module>/<package_config_rel>/
+    Fallback:
+        importlib.resources.files(<package_module>)/<package_config_rel>/
+
+    Also ensures MXM_CONFIG_HOME/machine.yaml exists for ${paths.data_root_base}.
     """
     target_dir = tmp_root / package_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve the package's on-disk config directory:
-    # e.g., importlib.resources.files("mxm_dataio") / "config"
-    src_dir = pkg_files(package_module) / package_config_rel
-    src_path = Path(str(src_dir))  # convert Traversable to a real filesystem path
+    # Resolve repo root (tests/conftest.py -> tests/ -> repo root)
+    repo_root = Path(__file__).resolve().parents[1]
 
+    # Prefer in-repo configs under the *module* directory
+    repo_cfg = repo_root / package_module / package_config_rel  # <-- IMPORTANT
+    if repo_cfg.exists() and any(
+        p.suffix.lower() == ".yaml" for p in repo_cfg.iterdir()
+    ):
+        src_path = repo_cfg
+    else:
+        # Fallback to installed package resources
+        src_path = Path(str(pkg_files(package_module) / package_config_rel))
+
+    # Mirror *.yaml into MXM_CONFIG_HOME/<package_name>/
     for p in src_path.iterdir():
         if p.suffix.lower() != ".yaml":
             continue
@@ -38,6 +53,13 @@ def _mirror_pkg_config(
             os.symlink(p, dst)
         except (OSError, NotImplementedError):
             shutil.copy2(p, dst)
+
+    # Ensure MXM_CONFIG_HOME/machine.yaml exists for ${paths.data_root_base}
+    machine_yaml = tmp_root / "machine.yaml"
+    if not machine_yaml.exists():
+        machine_yaml.write_text(
+            "paths:\n  data_root_base: /tmp/mxm\n", encoding="utf-8"
+        )
 
     return target_dir
 

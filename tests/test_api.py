@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
+from mxm_config import MXMConfig, make_subconfig
 
 from mxm_dataio.adapters import Fetcher, Sender
 from mxm_dataio.api import DataIoSession
@@ -82,19 +82,26 @@ _ = _clean_registry
 
 
 @pytest.fixture()
-def store_cfg(tmp_path: Path) -> dict[str, Any]:
-    return {
-        "paths": {
-            "data_root": str(tmp_path),
-            "db_path": str(tmp_path / "dataio.sqlite"),
-            "responses_dir": str(tmp_path / "responses"),
+def store_cfg_view(tmp_path: Path) -> MXMConfig:
+    """
+    Provide a temporary **dataio view** for tests (dot-access, read-only).
+    Shape expected by DataIoSession/Store:
+      paths.root, paths.db_path, paths.responses_dir
+    """
+    return make_subconfig(
+        {
+            "paths": {
+                "root": str(tmp_path),
+                "db_path": str(tmp_path / "dataio.sqlite"),
+                "responses_dir": str(tmp_path / "responses"),
+            }
         }
-    }
+    )
 
 
 @pytest.fixture()
-def store(store_cfg: dict[str, Any]) -> Store:
-    return Store.get_instance(store_cfg)
+def store(store_cfg_view: MXMConfig) -> Store:
+    return Store.get_instance(store_cfg_view)
 
 
 # --------------------------------------------------------------------------- #
@@ -103,11 +110,11 @@ def store(store_cfg: dict[str, Any]) -> Store:
 
 
 def test_session_lifecycle_updates_ended_at(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("dummy_fetch", DummyFetcher())
 
-    with DataIoSession(source="dummy_fetch", cfg=store_cfg):
+    with DataIoSession(source="dummy_fetch", cfg=store_cfg_view):
         pass  # open/close only
 
     with store.connect() as conn:
@@ -122,11 +129,11 @@ def test_session_lifecycle_updates_ended_at(
 
 
 def test_fetch_persists_request_response_and_payload(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("dummy_fetch", DummyFetcher())
 
-    with DataIoSession(source="dummy_fetch", cfg=store_cfg) as io:
+    with DataIoSession(source="dummy_fetch", cfg=store_cfg_view) as io:
         req = io.request(kind="demo", params={"a": 1})
         resp = io.fetch(req)
 
@@ -144,10 +151,10 @@ def test_fetch_persists_request_response_and_payload(
     assert n_resp == 1
 
 
-def test_fetch_cache_hit_returns_same_response(store_cfg: dict[str, Any]) -> None:
+def test_fetch_cache_hit_returns_same_response(store_cfg_view: MXMConfig) -> None:
     register("dummy_fetch", DummyFetcher())
 
-    with DataIoSession(source="dummy_fetch", cfg=store_cfg) as io:
+    with DataIoSession(source="dummy_fetch", cfg=store_cfg_view) as io:
         r1 = io.request(kind="demo", params={"x": 42})
         resp1 = io.fetch(r1)
         # A new Request with identical params should hit cache
@@ -157,10 +164,10 @@ def test_fetch_cache_hit_returns_same_response(store_cfg: dict[str, Any]) -> Non
     assert resp2.id == resp1.id  # cache returned the previously stored response
 
 
-def test_send_persists_ack_and_json_payload(store_cfg: dict[str, Any]) -> None:
+def test_send_persists_ack_and_json_payload(store_cfg_view: MXMConfig) -> None:
     register("dummy_send", DummySender())
 
-    with DataIoSession(source="dummy_send", cfg=store_cfg) as io:
+    with DataIoSession(source="dummy_send", cfg=store_cfg_view) as io:
         req = io.request(kind="post_demo", method=RequestMethod.POST, body={"x": 1})
         resp = io.send(req, payload={"hello": "world"})
 
@@ -173,30 +180,30 @@ def test_send_persists_ack_and_json_payload(store_cfg: dict[str, Any]) -> None:
     assert payload_bytes == b'{"hello":"world"}'
 
     # Sidecar metadata exists and contains adapter meta + content type
-    store = Store.get_instance(store_cfg)
+    store = Store.get_instance(store_cfg_view)
     meta = store.read_metadata(resp.checksum)
     assert meta["content_type"] == "application/json"
     assert meta["adapter_meta"]["ok"] == "1"
     assert meta["adapter_meta"]["len"] == str(len(b'{"hello":"world"}'))
 
 
-def test_capability_mismatch_raises(store_cfg: dict[str, Any]) -> None:
+def test_capability_mismatch_raises(store_cfg_view: MXMConfig) -> None:
     register("dummy_fetch", DummyFetcher())
     register("dummy_send", DummySender())
 
-    with DataIoSession(source="dummy_fetch", cfg=store_cfg) as io:
+    with DataIoSession(source="dummy_fetch", cfg=store_cfg_view) as io:
         req = io.request(kind="k", params={})
         with pytest.raises(TypeError):
             io.send(req, payload=b"nope")
 
-    with DataIoSession(source="dummy_send", cfg=store_cfg) as io:
+    with DataIoSession(source="dummy_send", cfg=store_cfg_view) as io:
         req = io.request(kind="k", params={})
         with pytest.raises(TypeError):
             io.fetch(req)
 
 
-def test_request_requires_entered_session(store_cfg: dict[str, Any]) -> None:
+def test_request_requires_entered_session(store_cfg_view: MXMConfig) -> None:
     register("dummy_fetch", DummyFetcher())
-    io = DataIoSession(source="dummy_fetch", cfg=store_cfg)
+    io = DataIoSession(source="dummy_fetch", cfg=store_cfg_view)
     with pytest.raises(RuntimeError):
         _ = io.request(kind="outside", params={})

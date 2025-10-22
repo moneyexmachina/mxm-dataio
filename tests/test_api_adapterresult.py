@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
+from mxm_config import MXMConfig, make_subconfig
 
 from mxm_dataio.adapters import Fetcher, Sender
 from mxm_dataio.api import DataIoSession
@@ -75,26 +75,29 @@ class SenderWithMeta(Sender):
 
 
 @pytest.fixture(autouse=True)
-def clean_registry() -> Iterator[None]:  # noqa: PT019
+def clean_registry() -> Iterator[None]:
     clear_registry()
     yield
     clear_registry()
 
 
 @pytest.fixture()
-def store_cfg(tmp_path: Path) -> dict[str, Any]:
-    return {
-        "paths": {
-            "data_root": str(tmp_path),
-            "db_path": str(tmp_path / "dataio.sqlite"),
-            "responses_dir": str(tmp_path / "responses"),
+def store_cfg_view(tmp_path: Path) -> MXMConfig:
+    """Temporary **dataio view** (dot-access) with only the paths Store needs."""
+    return make_subconfig(
+        {
+            "paths": {
+                "root": str(tmp_path),
+                "db_path": str(tmp_path / "dataio.sqlite"),
+                "responses_dir": str(tmp_path / "responses"),
+            }
         }
-    }
+    )
 
 
 @pytest.fixture()
-def store(store_cfg: dict[str, Any]) -> Store:
-    return Store.get_instance(store_cfg)
+def store(store_cfg_view: MXMConfig) -> Store:
+    return Store.get_instance(store_cfg_view)
 
 
 # --------------------------------------------------------------------------- #
@@ -103,11 +106,11 @@ def store(store_cfg: dict[str, Any]) -> Store:
 
 
 def test_fetch_adapterresult_writes_sidecar(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("fetch_meta", FetcherWithMeta())
 
-    with DataIoSession(source="fetch_meta", cfg=store_cfg) as io:
+    with DataIoSession(source="fetch_meta", cfg=store_cfg_view) as io:
         req = io.request(kind="k", params={"p": 1})
         resp = io.fetch(req)
 
@@ -123,11 +126,11 @@ def test_fetch_adapterresult_writes_sidecar(
 
 
 def test_send_adapterresult_writes_sidecar_ack(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("send_meta", SenderWithMeta())
 
-    with DataIoSession(source="send_meta", cfg=store_cfg) as io:
+    with DataIoSession(source="send_meta", cfg=store_cfg_view) as io:
         req = io.request(kind="post", method=RequestMethod.POST, body={"x": 1})
         resp = io.send(req, payload=b"abc")
 
@@ -141,11 +144,11 @@ def test_send_adapterresult_writes_sidecar_ack(
 
 
 def test_cache_hit_with_adapterresult_reuses_response(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("fetch_meta", FetcherWithMeta())
 
-    with DataIoSession(source="fetch_meta", cfg=store_cfg) as io:
+    with DataIoSession(source="fetch_meta", cfg=store_cfg_view) as io:
         r1 = io.request(kind="k", params={"same": 1})
         resp1 = io.fetch(r1)
         # Identical request → cache hit
@@ -162,11 +165,11 @@ def test_cache_hit_with_adapterresult_reuses_response(
 
 
 def test_use_cache_false_new_response_same_payload(
-    store_cfg: dict[str, Any], store: Store
+    store_cfg_view: MXMConfig, store: Store
 ) -> None:
     register("fetch_meta", FetcherWithMeta())
 
-    with DataIoSession(source="fetch_meta", cfg=store_cfg, use_cache=False) as io:
+    with DataIoSession(source="fetch_meta", cfg=store_cfg_view, use_cache=False) as io:
         r1 = io.request(kind="k", params={"same": 2})
         resp1 = io.fetch(r1)
         r2 = io.request(kind="k", params={"same": 2})

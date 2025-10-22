@@ -1,4 +1,5 @@
-"""Extended tests for mxm_dataio.store.
+"""
+Extended tests for mxm_dataio.store.
 
 These tests validate persistence, concurrency, and robustness aspects
 of the Store class beyond basic functional coverage.
@@ -11,9 +12,9 @@ import itertools
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
+from mxm_config import MXMConfig, make_subconfig
 
 from mxm_dataio.models import Session
 from mxm_dataio.store import Store
@@ -24,21 +25,28 @@ from mxm_dataio.store import Store
 
 
 @pytest.fixture()
-def store_cfg(tmp_path: Path) -> dict[str, Any]:
-    """Provide a temporary configuration dictionary for tests."""
-    return {
-        "paths": {
-            "data_root": str(tmp_path),
-            "db_path": str(tmp_path / "test.sqlite"),
-            "responses_dir": str(tmp_path / "responses"),
+def store_cfg_view(tmp_path: Path) -> MXMConfig:
+    """
+    Provide a temporary **dataio view** (MXMConfig) for tests.
+
+    Shape expected by Store:
+        paths.root, paths.db_path, paths.responses_dir
+    """
+    return make_subconfig(
+        {
+            "paths": {
+                "root": str(tmp_path),
+                "db_path": str(tmp_path / "test.sqlite"),
+                "responses_dir": str(tmp_path / "responses"),
+            }
         }
-    }
+    )
 
 
 @pytest.fixture()
-def store(store_cfg: dict[str, Any]) -> Store:
-    """Return a new Store instance for the temporary config."""
-    return Store(store_cfg)
+def store(store_cfg_view: MXMConfig) -> Store:
+    """Return a new Store instance for the temporary config view."""
+    return Store(store_cfg_view)
 
 
 # --------------------------------------------------------------------------- #
@@ -46,14 +54,14 @@ def store(store_cfg: dict[str, Any]) -> Store:
 # --------------------------------------------------------------------------- #
 
 
-def test_store_persistence_across_instances(store_cfg: dict[str, Any]) -> None:
+def test_store_persistence_across_instances(store_cfg_view: MXMConfig) -> None:
     """Data inserted by one Store instance should be visible to another."""
-    store1 = Store.get_instance(store_cfg)
+    store1 = Store.get_instance(store_cfg_view)
     session = Session(source="persist")
     store1.insert_session(session)
 
     # New instance reading the same DB
-    store2 = Store(store_cfg)
+    store2 = Store(store_cfg_view)
     with store2.connect() as conn:
         rows = conn.execute(
             "SELECT id FROM sessions WHERE id=?", (session.id,)
@@ -61,11 +69,11 @@ def test_store_persistence_across_instances(store_cfg: dict[str, Any]) -> None:
     assert len(rows) == 1, "Session should persist across instances"
 
 
-def test_singleton_thread_safety(store_cfg: dict[str, Any]) -> None:
+def test_singleton_thread_safety(store_cfg_view: MXMConfig) -> None:
     """get_instance should return the same object even under concurrency."""
 
     def create_store(_: object) -> Store:
-        return Store.get_instance(store_cfg)
+        return Store.get_instance(store_cfg_view)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(create_store, itertools.repeat(None, 5)))
@@ -115,7 +123,8 @@ def test_indexes_created(store: Store) -> None:
         names = {row[1] for row in conn.execute("PRAGMA index_list('responses')")}
         assert "idx_responses_request" in names
         assert "idx_responses_created" in names
-        assert "idx_responses_checksum" in names  # if you kept the optional one
+        # keep this if your schema creates it:
+        assert "idx_responses_checksum" in names
 
 
 def test_store_helpers_end_and_cache(store: Store) -> None:

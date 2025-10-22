@@ -6,17 +6,16 @@
 # the same environment.
 # ==============================================
 
-default:
-  mxm_dataio: {}
+default: {}
 
-offline:
-  mxm_dataio:
-    cache: { use_cache: true, write_cache: false, force_refresh: false }
-    http.timeout_s: 0.1
+research:
+  dataio:
+    paths:
+      db_path:       ${paths.data_root}/dataio_research.sqlite
+      responses_dir: ${paths.data_root}/responses_research
 
-test:
-  mxm_dataio:
-    audit.record_parse_log: false
-    cache: { use_cache: true, write_cache: false }
-    concurrency.workers: 2
-
+ci:
+  dataio:
+    paths:
+      db_path:       ${paths.data_root}/dataio_ci.sqlite
+      responses_dir: ${paths.data_root}/responses_ci

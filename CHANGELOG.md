@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
+## [0.2.2] – 2025-10-22
+### Changed
+- Simplified configuration structure:
+  - Removed redundant top-level `mxm_dataio:` subtree.
+  - Reduced defaults to a minimal `paths` and `cache` section only.
+  - Updated environment and profile YAMLs to use nested keys (`dataio:`) for correct OmegaConf merging.
+- Updated `config.py` to expose a single `dataio_view(cfg)` helper based on `mxm_config.make_view`.
+- Refactored `Store` and `DataIoSession` to accept an `MXMConfig` directly, supporting dot-access instead of raw mappings.
+- Adapted all tests for the new config shape and `MXMConfig` interface.
+
+### Fixed
+- Environment and profile overrides now merge correctly (e.g. `prod → use_cache: false`, `research → db_path`).
+- Eliminated dotted-key override bug in YAML merging.
+
+### Internal
+- All tests green again under the new configuration model.
+- Aligned structure with `mxm-datakraken` to support package-subtree config and view slicing.
 ## [0.2.1] – 2025-10-22
 
 ### Added

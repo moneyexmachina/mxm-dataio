@@ -1,53 +1,19 @@
-# ==============================================
-# mxm-dataio/config/default.yaml
-# ----------------------------------------------
-# Defines base path structure and subdirectories
-# for sources handled by the dataio package.
-# ==============================================
+# mxm-dataio — minimal default config
+# Only the bits needed by Store. Everything else can grow later under `dataio._reserved`.
 
 paths:
   data_root: ${paths.data_root_base}/${mxm_env}/dataio/${mxm_profile}
-  db_path: ${paths.data_root}/dataio.sqlite
-  responses_dir: ${paths.data_root}/responses
-  blobs_dir: ${paths.data_root}/blobs
-  tmp_dir: ${paths.data_root}/tmp
 
-mxm_dataio:
+dataio:
   paths:
-    root: ${paths.data_root}
-    db_path: ${paths.db_path}
-    responses_dir: ${paths.responses_dir}
-    blobs_dir: ${paths.blobs_dir}
-    tmp_dir: ${paths.tmp_dir}
-  store:
-    sqlite:
-      pragmas:
-        journal_mode: WAL
-        synchronous: NORMAL
-        cache_size: -20000
-      vacuum_on_close: false
-  serialization:
-    response_format: raw
-    compression: none
-    hash_algo: sha256
-  audit:
-    record_request: true
-    record_response: true
-    record_parse_log: true
-    redact_headers: ["Authorization", "Cookie"]
-    max_payload_bytes: 5242880
-  http:
-    timeout_s: 20.0
-    retries: { max_attempts: 3, backoff_ms: [500, 1000, 2000] }
-    politeness_ms: 1000
-    verify_ssl: true
-    headers:
-      User-Agent: mxm-dataio/0.2 (+contact@moneyexmachina.com)
-  concurrency:
-    workers: 8
+    root:          ${paths.data_root}
+    db_path:       ${paths.data_root}/dataio.sqlite
+    responses_dir: ${paths.data_root}/responses
+
+  # New: cache policy (DataIoSession reads only `cache.use_cache`)
   cache:
-    use_cache: true
-    write_cache: true
-    force_refresh: false
-  safety:
-    respect_robots: true
+    use_cache: true        # default; override per env below
+    # write_cache: true    # (optional, future)
+    # force_refresh: false # (optional, future)
+
+  _reserved: {}
