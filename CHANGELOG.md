@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
+## [0.3.0] – 2025-10-27
+
+### Added
+- **Policy-driven caching system** with `CacheMode` enum:
+  - `default` – use cached data if fresh, otherwise refetch  
+  - `only_if_cached` – never hit network; raise on cache miss  
+  - `bypass` – always fetch new data  
+  - `revalidate` – stub for future ETag support  
+  - `never` – fetch but never persist (ephemeral requests)
+- **Time-aware caching** via optional `ttl_seconds` field controlling cache freshness.
+- **Bucketed caching** using `as_of_bucket` for versioned or daily snapshots.
+- **Cache tag partitioning** (`cache_tag`) to distinguish parallel caches (e.g. locale "en"/"de").
+- **Response provenance** now mirrors request metadata (`cache_mode`, `ttl_seconds`, `as_of_bucket`, `cache_tag`, `fetched_at`) for self-contained auditability.
+- **Store.get_cached_response_by_request_hash_and_bucket()** method for precise lookup by request hash + bucket.
+- **CacheStore protocol stub** (`mxm_dataio/cache.py`) introducing forward-compatibility for separating ephemeral and archival storage.
+- Comprehensive **pytest suite** covering TTL expiration, bucket partitioning, and cache policy semantics.
+- Updated **README.md** with a new “Caching and Volatility” section.
+
+### Changed
+- `DataIoSession.fetch()` and `send()` now respect `cache_mode`, `ttl`, and `as_of_bucket` policy knobs.
+- `persist_result_as_response()` copies caching context into each `Response` for provenance.
+- Default behavior remains identical to pre-0.3.0 (`cache_mode="default"`, no TTL, no bucket).
+
+### Fixed
+- Eliminated stale-cache reuse beyond TTL expiry.
+- Correctly raise `RuntimeError` on cache miss under `CacheMode.ONLY_IF_CACHED`.
+- Verified deterministic hash composition excludes TTL and cache-mode policy (only `as_of_bucket` and `cache_tag` affect the key).
+
+### Internal
+- All new code validated with `pytest -q` and `pyright --strict`.
+- Project formatting aligned with `ruff` and `black`.
+
+---
+
+> **Release summary:**  
+> `mxm-dataio v0.3.0` introduces a fully time-aware, bucketed caching system—turning the ingestion layer into a deterministic archival and volatility-aware cache for the MXM ecosystem.
 ## [0.2.2] – 2025-10-22
 ### Changed
 - Simplified configuration structure:

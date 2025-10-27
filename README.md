@@ -126,6 +126,69 @@ from mxm_dataio.registry import register_adapter
 register_adapter("http", HttpFetcher())
 ```
 
+### Caching and Volatility
+
+Recent versions introduce a **policy-driven caching system** supporting:
+
+- **Volatile sources** (e.g. JustETF) that change daily  
+- **Eternal sources** (e.g. FCA FIRDS) that never mutate after release  
+- Fine-grained control via `cache_mode`, `ttl_seconds`, and `as_of_bucket`
+
+Each request/response pair now carries explicit provenance metadata.
+
+#### CacheMode semantics
+
+| Mode | Behavior |
+|------|-----------|
+| `default` | Use cached data if available and not expired; otherwise refetch |
+| `only_if_cached` | Never hit network; raise on cache miss |
+| `bypass` | Always refetch and persist new response |
+| `revalidate` | Future ETag support; currently same as `default` |
+| `never` | Fetch but never persist (ephemeral or side-effect requests) |
+
+#### Provenance fields
+
+| Field | Type | Meaning |
+|--------|------|---------|
+| `cache_mode` | Enum\[str] | Policy governing cache use |
+| `ttl_seconds` | float \| None | Time-to-live in seconds; older entries are refetched |
+| `as_of_bucket` | str \| None | Logical “time partition” (e.g. `"2025-10-27"`) |
+| `cache_tag` | str \| None | Optional sub-partition (e.g. language `"en"`) |
+
+Example embedded in saved JSON:
+
+```json
+"_provenance": {
+  "response_id": "resp-123",
+  "checksum": "sha256:…",
+  "fetched_at": "2025-10-27T10:45:12Z",
+  "cache_mode": "default",
+  "ttl_seconds": 86400,
+  "as_of_bucket": "2025-10-27",
+  "cache_tag": "en"
+}
+```
+
+#### Example usage
+
+```python
+from mxm_dataio.api import DataIoSession
+
+with DataIoSession(
+    source="justetf",
+    cfg=cfg,
+    cache_mode="default",
+    ttl=86400,
+    as_of_bucket="2025-10-27",
+) as s:
+    req = s.request(kind="http", params={"u": "A"})
+    resp = s.fetch(req)
+    print(resp.checksum, resp.as_of_bucket)
+```
+
+This enables reproducible daily snapshots for volatile sources while preserving
+eternal datasets indefinitely.
+
 ## Quick examples
 
 ### Fetch and cache a resource

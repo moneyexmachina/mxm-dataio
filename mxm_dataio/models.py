@@ -14,6 +14,15 @@ external call, while each Response captures the corresponding outcome.
 
 The models are dependency-light, serializable, and future-proof for
 asynchronous or streaming communication patterns.
+
+Caching and volatility
+----------------------
+Requests and Responses now include optional caching metadata
+(`cache_mode`, `ttl_seconds`, `as_of_bucket`, `fetched_at`) which
+allow `DataIoSession` to distinguish between volatile and stable
+sources, control cache reuse policies, and persist provenance for
+every collected payload.  These fields are informational only; all
+policy logic lives in the runtime API layer.
 """
 
 import hashlib
@@ -109,6 +118,14 @@ class Request:
     write operations (e.g., order placement), or control messages
     (e.g., subscribe/unsubscribe).  They are hashable and fully
     deterministic given identical parameters.
+
+    Caching metadata
+    ----------------
+    The optional fields `cache_mode`, `ttl_seconds`, and `as_of_bucket`
+    record the policy context under which the request was executed.
+    They are also incorporated into the deterministic request hash,
+    ensuring that time-bucketed or TTL-sensitive requests produce
+    distinct fingerprints.
     """
 
     session_id: str
@@ -118,11 +135,21 @@ class Request:
     body: dict[str, Any] | None = None
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=_utcnow)
+    cache_mode: str | None = None
+    ttl_seconds: float | None = None
+    as_of_bucket: str | None = None
+    cache_tag: str | None = None
     hash: str = field(init=False)
 
     def __post_init__(self) -> None:
         """Compute a deterministic hash for the request."""
-        serialized = _json_dumps({"params": self.params, "body": self.body})
+        base = {
+            "params": self.params,
+            "body": self.body,
+            "as_of_bucket": self.as_of_bucket,
+            "cache_tag": self.cache_tag,
+        }
+        serialized = _json_dumps(base)
         self.hash = hashlib.sha256(
             f"{self.kind}:{self.method}:{serialized}".encode("utf-8")
         ).hexdigest()
@@ -140,6 +167,14 @@ class Response:
     (for streaming or asynchronous interactions).  Each response stores
     a checksum for integrity verification and can reference a file path
     to the persisted payload.
+
+    Provenance and caching
+    ----------------------
+    Each response records its `fetched_at` timestamp and inherits the
+    caching context (`cache_mode`, `ttl_seconds`, `as_of_bucket`) from
+    the originating request.  These values enable reproducible
+    re-validation and cache-audit workflows, but do not affect checksum
+    computation or integrity verification.
     """
 
     request_id: str
@@ -150,6 +185,13 @@ class Response:
     id: str = field(default_factory=_uuid)
     sequence: int | None = None
     size_bytes: int | None = None
+
+    # Provenance / caching metadata (taken from Request)
+    fetched_at: datetime = field(default_factory=_utcnow)
+    cache_mode: str | None = None
+    ttl_seconds: float | None = None
+    as_of_bucket: str | None = None
+    cache_tag: str | None = None
 
     @classmethod
     def from_bytes(

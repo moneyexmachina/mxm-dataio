@@ -308,6 +308,21 @@ class Store:
                 size_bytes=row_resp[7],
             )
 
+    def get_cached_response_by_request_hash_and_bucket(
+        self,
+        request_hash: str,
+        as_of_bucket: str | None = None,
+    ) -> Optional["Response"]:
+        """Return the most recent Response for a previously-seen request hash and bucket.
+
+        Currently, the as_of_bucket is already encoded into the request hash,
+        so this simply delegates to `get_cached_response_by_request_hash()`.
+        The argument is accepted for forward compatibility, allowing future
+        schema extensions with explicit bucket columns.
+        """
+        _ = as_of_bucket
+        return self.get_cached_response_by_request_hash(request_hash)
+
     # ------------------------------------------------------------------ #
     # Payload management
     # ------------------------------------------------------------------ #

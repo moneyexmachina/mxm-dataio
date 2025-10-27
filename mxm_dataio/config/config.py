@@ -13,8 +13,6 @@ Typical usage
 
     cfg = load_config(package="mxm-dataio", env="dev", profile="default")
     dio = dataio_view(cfg)               # mxm_dataio subtree (read-only)
-    db_path = dataio_paths_view(cfg).db_path
-    timeout = dataio_http_view(cfg).timeout_s
 
 Notes
 -----
