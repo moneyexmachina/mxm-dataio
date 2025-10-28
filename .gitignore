@@ -26,3 +26,10 @@ htmlcov/
 
 data/
 
+# --- Build / packaging ---
+dist/
+build/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+wheelhouse/

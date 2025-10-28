@@ -124,7 +124,8 @@ def test_transaction_rollback(store: Store) -> None:
     try:
         with store.connect() as conn:
             conn.execute(
-                "INSERT INTO sessions (id, source, mode, as_of, started_at) VALUES (?, ?, ?, ?, ?)",
+                """INSERT INTO sessions (id, source, mode, as_of, started_at)
+                VALUES (?, ?, ?, ?, ?)""",
                 ("bad", "x", "sync", "now", "now"),
             )
             raise RuntimeError("force rollback")

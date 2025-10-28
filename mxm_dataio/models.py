@@ -31,7 +31,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+
+from mxm_dataio.types import AdapterMeta, HeadersLike, JSONLike, RequestParams
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -48,7 +49,7 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
-def _json_dumps(data: Any) -> str:
+def _json_dumps(data: JSONLike) -> str:
     """Deterministically serialize a Python object to JSON."""
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
@@ -131,8 +132,8 @@ class Request:
     session_id: str
     kind: str
     method: RequestMethod = RequestMethod.GET
-    params: dict[str, Any] | None = None
-    body: dict[str, Any] | None = None
+    params: RequestParams | None = None
+    body: JSONLike | None = None
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=_utcnow)
     cache_mode: str | None = None
@@ -143,7 +144,7 @@ class Request:
 
     def __post_init__(self) -> None:
         """Compute a deterministic hash for the request."""
-        base = {
+        base: JSONLike = {
             "params": self.params,
             "body": self.body,
             "as_of_bucket": self.as_of_bucket,
@@ -222,7 +223,8 @@ class Response:
         path: str,
         sequence: int | None = None,
     ) -> "Response":
-        """Create a Response from an AdapterResult (checksum/size derived from bytes)."""
+        """Create a Response from an AdapterResult (checksum/size derived
+        from bytes)."""
         return cls.from_bytes(
             request_id=request_id,
             status=status,
@@ -276,10 +278,10 @@ class AdapterResult:
     transport_status: int | None = None
     url: str | None = None
     elapsed_ms: int | None = None
-    headers: dict[str, str] | None = None
-    adapter_meta: dict[str, Any] | None = None
+    headers: HeadersLike | None = None
+    adapter_meta: AdapterMeta | None = None
 
-    def meta_dict(self) -> dict[str, Any]:
+    def meta_dict(self) -> dict[str, JSONLike]:
         """Return a JSON-serializable dict of all non-payload metadata."""
         return {
             k: v

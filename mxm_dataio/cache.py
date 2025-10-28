@@ -46,7 +46,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
-class CacheStoreProtocol(Protocol):
+class CacheStore(Protocol):
     """Minimal interface for ephemeral cache stores.
 
     Implementations MUST be safe for repeated gets/puts on the same key.
@@ -91,7 +91,7 @@ class FileCacheStore:
         If None, entries are treated as "always fresh" unless caller supplies ttl.
     """
 
-    def __init__(self, cache_dir: str | Path, default_ttl: float | None = None):
+    def __init__(self, cache_dir: str | Path, default_ttl: float | None = None) -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.default_ttl = default_ttl
@@ -119,9 +119,10 @@ class FileCacheStore:
 
     def put(self, key: str, data: bytes) -> Path:
         path = self._path(key)
-        # Best-effort atomic-ish write: write temp then replace could be added if needed.
+        # Best-effort atomic-ish write: write temp then replace could be added if
+        # needed.
         path.write_bytes(data)
         return path
 
 
-__all__ = ["CacheStoreProtocol", "FileCacheStore"]
+__all__ = ["CacheStore", "FileCacheStore"]

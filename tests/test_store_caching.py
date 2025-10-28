@@ -15,7 +15,7 @@ from mxm_dataio.cache import FileCacheStore
 from mxm_dataio.models import AdapterResult, Request, ResponseStatus
 from mxm_dataio.store import Store
 
-# ---------- Minimal concrete config (MXMConfig is a Protocol; don't instantiate it) ----------
+# ---------- Minimal concrete config (MXMConfig is a Protocol; don't instantiate it) ---
 
 
 @dataclass
@@ -30,7 +30,7 @@ class _CfgConcrete:
     paths: _CfgPaths
 
 
-# ---------- Dummy adapter that fully implements the abstract Fetcher contract ----------
+# ---------- Dummy adapter that fully implements the abstract Fetcher contract ---------
 
 
 class DummyFetcher(Fetcher):

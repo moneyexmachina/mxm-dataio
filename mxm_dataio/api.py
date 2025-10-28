@@ -26,11 +26,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Optional, Type
+from typing import Mapping, Optional, Type
 
 from mxm_config import MXMConfig
 
 from mxm_dataio.adapters import Fetcher, Sender
+from mxm_dataio.cache import CacheStore
 from mxm_dataio.models import (
     AdapterResult,
     Request,
@@ -42,6 +43,7 @@ from mxm_dataio.models import (
 )
 from mxm_dataio.registry import resolve_adapter
 from mxm_dataio.store import Store
+from mxm_dataio.types import JSONLike, RequestParams
 
 # --------------------------------------------------------------------------- #
 # Cache mode enumeration
@@ -90,8 +92,9 @@ class DataIoSession:
         Deprecated shim for backward compatibility.
     cache_store:
         Optional ephemeral cache layer. If provided, it is checked before the
-        archival Store and written through after successful fetches. Expected
-        to expose a minimal interface: get(key, ttl) → bytes | None; put(key, data) → Path.
+        archival Store and written through after successful fetches.
+        Expected to expose a minimal interface:
+        get(key, ttl) → bytes | None; put(key, data) → Path.
     """
 
     def __init__(
@@ -100,7 +103,7 @@ class DataIoSession:
         cfg: MXMConfig,
         *,
         store: Optional[Store] = None,
-        cache_store: Optional[Any] = None,
+        cache_store: Optional[CacheStore] = None,
         mode: SessionMode = SessionMode.SYNC,
         cache_mode: CacheMode | str = CacheMode.DEFAULT,
         ttl: float | None = None,
@@ -154,9 +157,9 @@ class DataIoSession:
         self,
         *,
         kind: str,
-        params: Optional[dict[str, Any]] = None,
+        params: RequestParams | None = None,
         method: RequestMethod = RequestMethod.GET,
-        body: Optional[dict[str, Any]] = None,
+        body: JSONLike | None = None,
     ) -> Request:
         """Create and persist a Request bound to the current session."""
         if self._session is None:
@@ -228,9 +231,8 @@ class DataIoSession:
 
         # 3) If ONLY_IF_CACHED and we didn't return above, it's a miss → raise
         if self.cache_mode == CacheMode.ONLY_IF_CACHED:
-            raise RuntimeError(
-                f"Cache miss for request hash={request.hash} bucket={request.as_of_bucket!r}"
-            )
+            miss = f"request hash={request.hash} bucket={request.as_of_bucket!r}"
+            raise RuntimeError(f"Cache miss for {miss}")
 
         # 4) Policy requires a fresh fetch (BYPASS/NEVER or stale/miss)
         result: AdapterResult = adapter.fetch(request)
@@ -276,7 +278,11 @@ class DataIoSession:
         self.store.insert_response(resp)
         return resp
 
-    def send(self, request: Request, payload: bytes | dict[str, Any]) -> Response:
+    def send(
+        self,
+        request: Request,
+        payload: bytes | Mapping[str, JSONLike],
+    ) -> Response:
         """Perform a send via a Sender-capable adapter and persist the Response."""
         adapter = resolve_adapter(self.source)
         if not isinstance(adapter, Sender):
@@ -325,7 +331,7 @@ class DataIoSession:
     # ------------------------------------------------------------------ #
 
     def _maybe_get_cached_response(self, request: Request) -> Optional[Response]:
-        """Return the most recent Response for a previously-seen request hash and bucket."""
+        """Return the newest cached Response for this request hash/bucket."""
         try:
             return self.store.get_cached_response_by_request_hash_and_bucket(
                 request.hash, request.as_of_bucket
@@ -373,7 +379,7 @@ def persist_result_as_response(
     return resp
 
 
-def _ensure_bytes(payload: bytes | dict[str, Any]) -> bytes:
+def _ensure_bytes(payload: bytes | Mapping[str, JSONLike]) -> bytes:
     if isinstance(payload, (bytes, bytearray, memoryview)):
         return bytes(payload)
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

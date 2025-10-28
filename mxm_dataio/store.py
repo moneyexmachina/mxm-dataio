@@ -21,11 +21,12 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ClassVar, Final, Generator, Optional
+from typing import ClassVar, Final, Generator, Optional
 
 from mxm_config import MXMConfig
 
 from mxm_dataio.models import Request, Response, Session
+from mxm_dataio.types import JSONLike
 
 # --------------------------------------------------------------------------- #
 # Store class
@@ -51,7 +52,7 @@ class Store:
     _instances: ClassVar[dict[str, "Store"]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, cfg: MXMConfig):
+    def __init__(self, cfg: MXMConfig) -> None:
         """Initialize the Store from a resolved configuration object."""
 
         # Required: paths.root
@@ -103,7 +104,8 @@ class Store:
             db_path = root / "dataio.sqlite"
 
         # Normalize for a stable key (no FS requirement)
-        # expanduser to unify ~; resolve(strict=False) to collapse .. without touching FS
+        # expanduser to unify ~; resolve(strict=False) to collapse ..
+        # without touching FS
         key: Final[str] = db_path.expanduser().resolve(strict=False).as_posix()
 
         with cls._lock:
@@ -178,16 +180,28 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS idx_requests_hash ON requests(hash);"
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);"
+                """
+                CREATE INDEX IF NOT EXISTS idx_requests_session
+                ON requests(session_id);
+                """
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_responses_request ON responses(request_id);"
+                """
+                CREATE INDEX IF NOT EXISTS idx_responses_request
+                ON responses(request_id);
+                """
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_responses_created ON responses(created_at);"
+                """
+                CREATE INDEX IF NOT EXISTS idx_responses_created
+                ON responses(created_at);
+                """
             )
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_responses_checksum ON responses(checksum);"
+                """
+                CREATE INDEX IF NOT EXISTS idx_responses_checksum
+                ON responses(checksum);
+                """
             )
 
     # ------------------------------------------------------------------ #
@@ -228,8 +242,8 @@ class Store:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO requests
-                (id, session_id, kind, method, params_json, body_json, hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, session_id, kind, method, params_json, body_json, hash,
+                created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request.id,
@@ -249,8 +263,8 @@ class Store:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO responses
-                (id, request_id, status, sequence, checksum, path, created_at, size_bytes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, request_id, status, sequence, checksum, path, created_at,
+                size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     response.id,
@@ -271,10 +285,13 @@ class Store:
     def get_cached_response_by_request_hash(
         self, request_hash: str
     ) -> Optional["Response"]:
-        """Return the most recent Response for a previously-seen request hash, if any."""
+        """Return the most recent Response for a previously-seen request hash,
+        if any."""
         with self.connect() as conn:
             row_req = conn.execute(
-                "SELECT id FROM requests WHERE hash = ? ORDER BY created_at DESC LIMIT 1",
+                """SELECT id FROM requests WHERE hash = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
                 (request_hash,),
             ).fetchone()
             if row_req is None:
@@ -282,7 +299,8 @@ class Store:
 
             row_resp = conn.execute(
                 """
-                SELECT id, request_id, status, sequence, checksum, path, created_at, size_bytes
+                SELECT id, request_id, status, sequence, checksum, path,
+                created_at, size_bytes
                 FROM responses
                 WHERE request_id = ?
                 ORDER BY created_at DESC, COALESCE(sequence, -1) DESC
@@ -313,7 +331,8 @@ class Store:
         request_hash: str,
         as_of_bucket: str | None = None,
     ) -> Optional["Response"]:
-        """Return the most recent Response for a previously-seen request hash and bucket.
+        """Return the most recent Response for a previously-seen request hash
+        and bucket.
 
         Currently, the as_of_bucket is already encoded into the request hash,
         so this simply delegates to `get_cached_response_by_request_hash()`.
@@ -343,7 +362,7 @@ class Store:
             raise ValueError(f"Checksum mismatch for {path}")
         return data
 
-    def write_metadata(self, checksum: str, meta: dict[str, Any]) -> Path:
+    def write_metadata(self, checksum: str, meta: dict[str, JSONLike]) -> Path:
         """Write response metadata as a sidecar JSON file next to the payload.
 
         Uses sorted keys and minified separators for determinism, and
@@ -360,7 +379,7 @@ class Store:
             path.write_text(text, encoding="utf-8")
         return path
 
-    def read_metadata(self, checksum: str) -> dict[str, Any]:
+    def read_metadata(self, checksum: str) -> dict[str, object]:
         import json
 
         path = self.responses_dir / f"{checksum}.meta.json"
@@ -378,7 +397,7 @@ class Store:
         return hashlib.sha256(data).hexdigest()
 
     @staticmethod
-    def _safe_json(data: Any | None) -> str | None:
+    def _safe_json(data: JSONLike | None) -> str | None:
         """Serialize a Python object to JSON or return None."""
         if data is None:
             return None
@@ -394,7 +413,10 @@ class Store:
         """Return a list of (id, source, mode, started_at) for all sessions."""
         with self.connect() as conn:
             cur = conn.execute(
-                "SELECT id, source, mode, started_at FROM sessions ORDER BY started_at DESC"
+                """
+                SELECT id, source, mode, started_at FROM sessions
+                ORDER BY started_at DESC
+                """
             )
             return list(cur.fetchall())
 
