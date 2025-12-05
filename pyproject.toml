@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.3.0"
+version = "0.4.0"
 description = "**Unified ingestion, caching, and audit layer Money Ex Machina**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
@@ -25,8 +25,7 @@ build-backend = "poetry.core.masonry.api"
 line-length = 88
 target-version = "py313"
 # Select rulesets; expand gradually if desired
-select = ["E", "F", "B", "ANN"]
-ignore = ["ANN101", "ANN102"]
+lint.select = ["E", "F", "B", "ANN"]
 # Exclude common non-source dirs
 exclude = ["build", "dist", ".venv"]
 
@@ -41,7 +40,7 @@ line_length = 88
 combine_as_imports = true
 
 [tool.pyright]
-typeCheckingMode = "strict"            # or "strict" if you want more enforcement
+typeCheckingMode = "strict"
 include = ["mxm_dataio"]
 exclude = ["build", "dist", "docs", ".venv"]
 pythonVersion = "3.13"
