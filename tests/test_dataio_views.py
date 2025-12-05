@@ -8,7 +8,7 @@ from mxm_config import load_config
 from omegaconf import DictConfig
 from omegaconf.errors import ReadonlyConfigError
 
-from mxm_dataio.config.config import dataio_view
+from mxm.dataio.config.config import dataio_view
 
 
 def _load_cfg_from_repo_yaml(
@@ -18,7 +18,7 @@ def _load_cfg_from_repo_yaml(
     profile: str = "default",
 ) -> DictConfig:
     # Mirror mxm_dataio/config/*.yaml into MXM_CONFIG_HOME/mxm-dataio/
-    mxm_config_home("mxm-dataio", "mxm_dataio")
+    mxm_config_home("mxm-dataio", "src/mxm/dataio")
     cfg = cast(DictConfig, load_config(package="mxm-dataio", env=env, profile=profile))
     assert isinstance(cfg, DictConfig)
     return cfg

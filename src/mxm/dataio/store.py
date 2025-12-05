@@ -25,8 +25,8 @@ from typing import ClassVar, Final, Generator, Optional
 
 from mxm_config import MXMConfig
 
-from mxm_dataio.models import Request, Response, Session
-from mxm_dataio.types import JSONLike
+from mxm.dataio.models import Request, Response, Session
+from mxm.dataio.types import JSONLike
 
 # --------------------------------------------------------------------------- #
 # Store class
@@ -313,7 +313,7 @@ class Store:
                 return None
 
             # Local import to avoid circular deps
-            from mxm_dataio.models import Response, ResponseStatus
+            from mxm.dataio.models import Response, ResponseStatus
 
             return Response(
                 id=row_resp[0],

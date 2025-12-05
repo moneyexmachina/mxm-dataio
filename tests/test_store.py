@@ -14,8 +14,8 @@ from typing import cast
 import pytest
 from mxm_config import MXMConfig, make_subconfig
 
-from mxm_dataio.models import Request, Response, ResponseStatus, Session
-from mxm_dataio.store import Store
+from mxm.dataio.models import Request, Response, ResponseStatus, Session
+from mxm.dataio.store import Store
 
 # --------------------------------------------------------------------------- #
 # Fixtures

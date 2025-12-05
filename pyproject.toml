@@ -5,8 +5,8 @@ description = "**Unified ingestion, caching, and audit layer Money Ex Machina**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
 readme = "README.md"
-packages = [{ include = "mxm_dataio" }]
-include = ["mxm_dataio/py.typed"]
+packages = [{ include = "mxm", from = "src" }]
+include = ["src/mxm/dataio/py.typed"]
 classifiers = ["Typing :: Typed"]
 
 [tool.poetry.dependencies]
@@ -41,7 +41,7 @@ combine_as_imports = true
 
 [tool.pyright]
 typeCheckingMode = "strict"
-include = ["mxm_dataio"]
+include = ["src"]
 exclude = ["build", "dist", "docs", ".venv"]
 pythonVersion = "3.13"
 pythonPlatform = "All"

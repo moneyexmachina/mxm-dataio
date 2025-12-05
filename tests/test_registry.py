@@ -11,8 +11,8 @@ from collections.abc import Iterator
 
 import pytest
 
-from mxm_dataio import registry
-from mxm_dataio.adapters import MXMDataIoAdapter
+from mxm.dataio import registry
+from mxm.dataio.adapters import MXMDataIoAdapter
 
 # --------------------------------------------------------------------------- #
 # Fixtures and Dummy Adapters

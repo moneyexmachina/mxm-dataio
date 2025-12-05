@@ -30,9 +30,9 @@ from typing import Mapping, Optional, Type
 
 from mxm_config import MXMConfig
 
-from mxm_dataio.adapters import Fetcher, Sender
-from mxm_dataio.cache import CacheStore
-from mxm_dataio.models import (
+from mxm.dataio.adapters import Fetcher, Sender
+from mxm.dataio.cache import CacheStore
+from mxm.dataio.models import (
     AdapterResult,
     Request,
     RequestMethod,
@@ -41,9 +41,9 @@ from mxm_dataio.models import (
     Session,
     SessionMode,
 )
-from mxm_dataio.registry import resolve_adapter
-from mxm_dataio.store import Store
-from mxm_dataio.types import JSONLike, RequestParams
+from mxm.dataio.registry import resolve_adapter
+from mxm.dataio.store import Store
+from mxm.dataio.types import JSONLike, RequestParams
 
 # --------------------------------------------------------------------------- #
 # Cache mode enumeration

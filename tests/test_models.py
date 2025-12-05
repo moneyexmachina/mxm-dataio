@@ -1,6 +1,6 @@
 import hashlib
 
-from mxm_dataio.models import (
+from mxm.dataio.models import (
     Request,
     RequestMethod,
     Response,

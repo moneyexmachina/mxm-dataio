@@ -20,8 +20,8 @@ For **streaming**, adapters should expose an *async iterator* that yields
 
 Example
 -------
-    from mxm_dataio.adapters import Fetcher, AdapterResult
-    from mxm_dataio.models import Request
+    from mxm.dataio.adapters import Fetcher, AdapterResult
+    from mxm.dataio.models import Request
 
     class JustETFFetcher:
         source = "justetf"
@@ -36,7 +36,7 @@ Example
 
 from typing import AsyncIterator, Protocol, runtime_checkable
 
-from mxm_dataio.models import AdapterResult, Request
+from mxm.dataio.models import AdapterResult, Request
 
 
 @runtime_checkable

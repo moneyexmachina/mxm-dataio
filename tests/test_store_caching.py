@@ -8,12 +8,12 @@ from typing import Optional, cast
 import pytest
 from mxm_config import MXMConfig
 
-import mxm_dataio.api as api_mod  # for monkeypatching resolve_adapter
-from mxm_dataio.adapters import Fetcher
-from mxm_dataio.api import CacheMode, DataIoSession
-from mxm_dataio.cache import FileCacheStore
-from mxm_dataio.models import AdapterResult, Request, ResponseStatus
-from mxm_dataio.store import Store
+import mxm.dataio.api as api_mod  # for monkeypatching resolve_adapter
+from mxm.dataio.adapters import Fetcher
+from mxm.dataio.api import CacheMode, DataIoSession
+from mxm.dataio.cache import FileCacheStore
+from mxm.dataio.models import AdapterResult, Request, ResponseStatus
+from mxm.dataio.store import Store
 
 # ---------- Minimal concrete config (MXMConfig is a Protocol; don't instantiate it) ---
 

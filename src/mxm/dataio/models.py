@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
-from mxm_dataio.types import AdapterMeta, HeadersLike, JSONLike, RequestParams
+from mxm.dataio.types import AdapterMeta, HeadersLike, JSONLike, RequestParams
 
 # --------------------------------------------------------------------------- #
 # Utility helpers

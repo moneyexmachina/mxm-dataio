@@ -9,8 +9,8 @@ high-level components (such as IngestSession) can remain protocol-agnostic.
 
 Usage
 -----
-    from mxm_dataio.registry import register, resolve_adapter, list_registered
-    from mxm_dataio.adapters import Fetcher
+    from mxm.dataio.registry import register, resolve_adapter, list_registered
+    from mxm.dataio.adapters import Fetcher
 
     class DummyFetcher:
         source = "dummy"
@@ -25,7 +25,7 @@ Usage
 
 from __future__ import annotations
 
-from mxm_dataio.adapters import MXMDataIoAdapter
+from mxm.dataio.adapters import MXMDataIoAdapter
 
 # --------------------------------------------------------------------------- #
 # Internal registry store
