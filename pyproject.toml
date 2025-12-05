@@ -10,8 +10,9 @@ include = ["src/mxm/dataio/py.typed"]
 classifiers = ["Typing :: Typed"]
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = ">=3.13, <3.15"
 mxm-config = ">=0.3.0" 
+mxm-types = "^0.1.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
