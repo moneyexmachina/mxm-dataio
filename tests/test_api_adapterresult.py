@@ -9,11 +9,11 @@ from pathlib import Path
 import pytest
 from mxm_config import MXMConfig, make_subconfig
 
-from mxm_dataio.adapters import Fetcher, Sender
-from mxm_dataio.api import DataIoSession
-from mxm_dataio.models import AdapterResult, Request, RequestMethod, ResponseStatus
-from mxm_dataio.registry import clear_registry, register
-from mxm_dataio.store import Store
+from mxm.dataio.adapters import Fetcher, Sender
+from mxm.dataio.api import DataIoSession
+from mxm.dataio.models import AdapterResult, Request, RequestMethod, ResponseStatus
+from mxm.dataio.registry import clear_registry, register
+from mxm.dataio.store import Store
 
 # --------------------------------------------------------------------------- #
 # Dummy adapters: always return AdapterResult

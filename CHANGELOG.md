@@ -134,7 +134,7 @@ To migrate:
 1. Update custom adapters to return an `AdapterResult` instead of raw bytes.  
    Example:
    ```python
-   from mxm_dataio.models import AdapterResult
+   from mxm.dataio.models import AdapterResult
    return AdapterResult(data=response_bytes, content_type="application/json")
    ```
 2. No changes needed for consumers of `DataIoSession` or `Store`.

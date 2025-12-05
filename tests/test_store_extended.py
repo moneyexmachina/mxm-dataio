@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 from mxm_config import MXMConfig, make_subconfig
 
-from mxm_dataio.models import Session
-from mxm_dataio.store import Store
+from mxm.dataio.models import Session
+from mxm.dataio.store import Store
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -130,7 +130,7 @@ def test_indexes_created(store: Store) -> None:
 def test_store_helpers_end_and_cache(store: Store) -> None:
     from datetime import datetime, timezone
 
-    from mxm_dataio.models import (
+    from mxm.dataio.models import (
         Request,
         RequestMethod,
         Response,
@@ -164,7 +164,7 @@ def test_store_helpers_end_and_cache(store: Store) -> None:
 
 
 def test_mark_session_ended_accepts_none(store: Store) -> None:
-    from mxm_dataio.models import Session
+    from mxm.dataio.models import Session
 
     sess = Session(source="unit")
     store.insert_session(sess)

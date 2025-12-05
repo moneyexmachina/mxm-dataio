@@ -56,10 +56,10 @@ Raw bytes and parsed metadata are stored under:
 The main entry point for ingestion or submission tasks.
 
 ```python
-from mxm_dataio.api import DataIoSession
-from mxm_dataio.adapters import HttpFetcher
+from mxm.dataio.api import DataIoSession
+from mxm.dataio.adapters import HttpFetcher
 from mxm_config import load_config
-from mxm_dataio.config.config import dataio_view
+from mxm.dataio.config.config import dataio_view
 
 cfg = load_config(package="mxm-dataio", env="dev", profile="default")
 dio_cfg = dataio_view(cfg)
@@ -105,8 +105,8 @@ Example (simplified):
 
 ```python
 from typing import Any
-from mxm_dataio.adapters import BaseFetcher
-from mxm_dataio.types import AdapterResult
+from mxm.dataio.adapters import BaseFetcher
+from mxm.dataio.types import AdapterResult
 import requests
 
 class HttpFetcher(BaseFetcher):
@@ -122,7 +122,7 @@ class HttpFetcher(BaseFetcher):
 
 Adapters can be registered dynamically:
 ```python
-from mxm_dataio.registry import register_adapter
+from mxm.dataio.registry import register_adapter
 register_adapter("http", HttpFetcher())
 ```
 
@@ -172,7 +172,7 @@ Example embedded in saved JSON:
 #### Example usage
 
 ```python
-from mxm_dataio.api import DataIoSession
+from mxm.dataio.api import DataIoSession
 
 with DataIoSession(
     source="justetf",

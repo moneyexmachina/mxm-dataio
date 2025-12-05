@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from mxm_config import MXMConfig, make_subconfig
 
-from mxm_dataio.store import Store
+from mxm.dataio.store import Store
 
 # --------------------------------------------------------------------------- #
 # Fixtures
