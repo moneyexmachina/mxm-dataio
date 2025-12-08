@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from mxm_config import MXMConfig, make_subconfig
+from mxm.config import MXMConfig, make_subconfig
 
 from mxm.dataio.store import Store
 

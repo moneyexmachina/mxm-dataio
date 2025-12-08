@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, cast
 
 import pytest
-from mxm_config import MXMConfig
+from mxm.config import MXMConfig
 
 import mxm.dataio.api as api_mod  # for monkeypatching resolve_adapter
 from mxm.dataio.adapters import Fetcher
