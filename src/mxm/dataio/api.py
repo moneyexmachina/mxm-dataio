@@ -29,7 +29,7 @@ from types import TracebackType
 from typing import Mapping, Optional, Type
 
 from mxm.types import JSONLike, JSONObj
-from mxm_config import MXMConfig
+from mxm.config import MXMConfig
 
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.cache import CacheStore

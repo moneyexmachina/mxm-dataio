@@ -1,17 +1,22 @@
 [tool.poetry]
 name = "mxm-dataio"
 version = "0.4.0"
-description = "**Unified ingestion, caching, and audit layer Money Ex Machina**"
+description = "**Unified ingestion, caching, and audit layer for Money Ex Machina.**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
 readme = "README.md"
 packages = [{ include = "mxm", from = "src" }]
-include = ["src/mxm/dataio/py.typed"]
+include = [
+  { path = "LICENSE" },
+  { path = "src/mxm/dataio/py.typed", format = "wheel" },
+  { path = "src/mxm/dataio/_data/seeds/**/*.yaml", format = "wheel" },
+]
+
 classifiers = ["Typing :: Typed"]
 
 [tool.poetry.dependencies]
 python = ">=3.13, <3.15"
-mxm-config = ">=0.3.0" 
+mxm-config = ">=0.5.0" 
 mxm-types = "^0.1.1"
 
 [build-system]

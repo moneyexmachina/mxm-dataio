@@ -58,7 +58,7 @@ The main entry point for ingestion or submission tasks.
 ```python
 from mxm.dataio.api import DataIoSession
 from mxm.dataio.adapters import HttpFetcher
-from mxm_config import load_config
+from mxm.config import load_config
 from mxm.dataio.config.config import dataio_view
 
 cfg = load_config(package="mxm-dataio", env="dev", profile="default")
@@ -97,6 +97,25 @@ class AdapterResult:
 of the global MXM config. Downstream packages obtain read-only
 views via `mxm_config.make_view`.
 
+
+### Configuration contract for `mxm-dataio`
+
+`mxm-dataio` is a library and does not define a full application by itself.
+However, it ships a reference `mxm-config` seed tree under:
+
+- `src/mxm/dataio/_data/seed/dataio/`
+
+This tree contains the standard 5-level structure expected by `mxm-config`:
+
+- `default.yaml`
+- `machine.yaml`
+- `environment.yaml`
+- `profile.yaml`
+- `local.yaml`
+
+Downstream applications are expected to define their own `app_id` and config
+trees, but can copy or adapt this `dataio` seed as the canonical contract for
+how `mxm-dataio` expects to be configured (paths, cache roots, etc.).
 
 ## Adapters
 

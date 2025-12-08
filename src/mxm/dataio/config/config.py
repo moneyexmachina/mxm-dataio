@@ -8,7 +8,7 @@ no I/O at import time—callers should obtain a global `MXMConfig` via
 
 Typical usage
 -------------
-    from mxm_config import load_config
+    from mxm.config import load_config
     from mxm.dataio.config import dataio_view, dataio_paths_view, dataio_http_view
 
     cfg = load_config(package="mxm-dataio", env="dev", profile="default")
@@ -26,7 +26,7 @@ Notes
 
 from __future__ import annotations
 
-from mxm_config import MXMConfig, make_view
+from mxm.config import MXMConfig, make_view
 
 
 def dataio_view(cfg: MXMConfig, *, resolve: bool = True) -> MXMConfig:

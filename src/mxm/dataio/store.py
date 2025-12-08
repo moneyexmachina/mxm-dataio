@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import ClassVar, Final, Generator, Optional
 
 from mxm.types import JSONLike, JSONMap
-from mxm_config import MXMConfig
+from mxm.config import MXMConfig
 
 from mxm.dataio.models import Request, Response, Session
 

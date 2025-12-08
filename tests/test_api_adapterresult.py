@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from mxm_config import MXMConfig, make_subconfig
+from mxm.config import MXMConfig, make_subconfig
 
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.api import DataIoSession
