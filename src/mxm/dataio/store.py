@@ -23,10 +23,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Final, Generator, Optional
 
+from mxm.types import JSONLike, JSONMap
 from mxm_config import MXMConfig
 
 from mxm.dataio.models import Request, Response, Session
-from mxm.dataio.types import JSONLike
 
 # --------------------------------------------------------------------------- #
 # Store class
@@ -362,7 +362,7 @@ class Store:
             raise ValueError(f"Checksum mismatch for {path}")
         return data
 
-    def write_metadata(self, checksum: str, meta: dict[str, JSONLike]) -> Path:
+    def write_metadata(self, checksum: str, meta: JSONMap) -> Path:
         """Write response metadata as a sidecar JSON file next to the payload.
 
         Uses sorted keys and minified separators for determinism, and

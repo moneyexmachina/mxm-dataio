@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
+## [0.4.0] - 2025-12-08
+
+### Changed
+- Replaced local JSON-related type aliases in `mxm-dataio` with the shared primitives from `mxm-types` (`JSONScalar`, `JSONValue`, `JSONLike`, `JSONObj`, `JSONMap`, `StrPath`, `HeadersLike`).
+- Normalised adapter return metadata (`AdapterResult.meta_dict`) to a strict `JSONMap`, suitable for JSON serialisation and downstream inspection.
+
+### Removed
+- Removed `src/mxm/dataio/types.py` and redundant package-local type aliases (`JSONScalar`, `JSONLike`, `RequestParams`, `PathLike`, `AdapterMeta`) in favour of the canonical vocabulary in `mxm.types`.
+
+
 ## [0.3.0] – 2025-10-27
 
 ### Added

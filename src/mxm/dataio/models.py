@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
-from mxm.dataio.types import AdapterMeta, HeadersLike, JSONLike, RequestParams
+from mxm.types import HeadersLike, JSONLike, JSONMap, JSONObj
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -132,7 +132,7 @@ class Request:
     session_id: str
     kind: str
     method: RequestMethod = RequestMethod.GET
-    params: RequestParams | None = None
+    params: JSONObj | None = None
     body: JSONLike | None = None
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=_utcnow)
@@ -279,20 +279,38 @@ class AdapterResult:
     url: str | None = None
     elapsed_ms: int | None = None
     headers: HeadersLike | None = None
-    adapter_meta: AdapterMeta | None = None
+    adapter_meta: JSONObj | None = None
 
-    def meta_dict(self) -> dict[str, JSONLike]:
+    def meta_dict(self) -> JSONMap:
         """Return a JSON-serializable dict of all non-payload metadata."""
-        return {
-            k: v
-            for k, v in {
-                "content_type": self.content_type,
-                "encoding": self.encoding,
-                "transport_status": self.transport_status,
-                "url": self.url,
-                "elapsed_ms": self.elapsed_ms,
-                "headers": self.headers,
-                "adapter_meta": self.adapter_meta,
-            }.items()
-            if v is not None
-        }
+
+        result: JSONMap = {}
+
+        if self.content_type is not None:
+            result["content_type"] = self.content_type
+
+        if self.encoding is not None:
+            result["encoding"] = self.encoding
+
+        if self.transport_status is not None:
+            result["transport_status"] = self.transport_status
+
+        if self.url is not None:
+            result["url"] = self.url
+
+        if self.elapsed_ms is not None:
+            result["elapsed_ms"] = self.elapsed_ms
+
+        if self.headers is not None:
+            headers_map: JSONMap = {}
+            for key, value in self.headers.items():
+                if isinstance(value, str):
+                    headers_map[key] = value
+                else:
+                    headers_map[key] = list(value)
+            result["headers"] = headers_map
+
+        if self.adapter_meta is not None:
+            result["adapter_meta"] = dict(self.adapter_meta)
+
+        return result
