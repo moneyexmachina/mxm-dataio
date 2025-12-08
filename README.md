@@ -79,6 +79,7 @@ with DataIoSession(source="http", cfg=dio_cfg) as io:
 ```python
 
 from typing import Any
+from mxm.types import HeadersLike, JSONObj
 
 class AdapterResult:
     data: bytes
@@ -86,8 +87,8 @@ class AdapterResult:
     transport_status: int | None
     url: str | None
     elapsed_ms: int | None
-    headers: dict[str, str] | None
-    adapter_meta: dict[str, Any] | None
+    headers: HeadersLike | None
+    adapter_meta: JSONObj | None
 ```
 
 ## Configuration
@@ -237,18 +238,6 @@ black --check .
 - Delta auditing and content hashing improvements.  
 - CLI for session inspection and cache management.  
 
-## Repository layout
-
-```
-mxm_dataio/
-  adapters/       → built-in adapter implementations
-  config/         → default YAMLs and view helpers
-  store/          → persistence backend
-  types.py        → protocol and dataclasses
-tests/            → pytest suite (hermetic)
-```
-
 ## License
 
-MIT © Money Ex Machina
-Unified ingestion, caching, and audit layer for the Money Ex Machina (MXM) ecosystem. `mxm-dataio` records every interaction with an external system—who/what/when, the exact bytes returned, and optional transport metadata—so downstream packages are reproducible and auditable.
+MIT License. See [LICENSE](LICENSE).

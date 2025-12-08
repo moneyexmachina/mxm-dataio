@@ -28,6 +28,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Mapping, Optional, Type
 
+from mxm.types import JSONLike, JSONObj
 from mxm_config import MXMConfig
 
 from mxm.dataio.adapters import Fetcher, Sender
@@ -43,7 +44,6 @@ from mxm.dataio.models import (
 )
 from mxm.dataio.registry import resolve_adapter
 from mxm.dataio.store import Store
-from mxm.dataio.types import JSONLike, RequestParams
 
 # --------------------------------------------------------------------------- #
 # Cache mode enumeration
@@ -157,7 +157,7 @@ class DataIoSession:
         self,
         *,
         kind: str,
-        params: RequestParams | None = None,
+        params: JSONObj | None = None,
         method: RequestMethod = RequestMethod.GET,
         body: JSONLike | None = None,
     ) -> Request:
