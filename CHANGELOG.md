@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
+## [0.4.1] – 2026-01-21
+
+### Fixed
+- Restored cache integrity invariant in `DataIoSession.fetch()` by treating
+  archive-cached responses with missing payload files as cache misses.
+- Missing or externally deleted payload files no longer raise `FileNotFoundError`;
+  the request is transparently reissued and a new response is persisted.
+- Preserved append-only audit semantics in the Store: no cached metadata is
+  deleted or mutated as part of cache integrity recovery.
+- Added a unit test covering the missing-payload reissue behaviour to prevent
+  regressions.
+
 ## [0.4.0] - 2025-12-08
 
 ### Changed

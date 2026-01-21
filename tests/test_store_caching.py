@@ -282,6 +282,47 @@ def test_revalidate_behaves_like_default_without_support(
     assert dummy_fetcher.calls == 1  # cache hit
 
 
+def test_missing_archive_payload_is_treated_as_cache_miss_and_reissued(
+    tmp_cfg_dataio: MXMConfig,
+    store_dataio: Store,
+    dummy_fetcher: DummyFetcher,
+) -> None:
+    # Prime archive cache
+    with _mk_session(
+        "dummy",
+        tmp_cfg_dataio,
+        cache_mode=CacheMode.DEFAULT,
+        ttl=999,
+        as_of_bucket="MP",
+    ) as s:
+        req = s.request(kind="http", params={"u": "A"})
+        resp1 = s.fetch(req)
+        assert resp1.status == ResponseStatus.OK
+        assert dummy_fetcher.calls == 1
+        p1 = Path(resp1.path)
+        assert p1.exists()
+
+    # Simulate manual/accidental deletion of the archived payload
+    p1.unlink()
+    assert not p1.exists()
+
+    # Same request again should reissue and produce a new payload file (no exception)
+    with _mk_session(
+        "dummy",
+        tmp_cfg_dataio,
+        cache_mode=CacheMode.DEFAULT,
+        ttl=999,
+        as_of_bucket="MP",
+    ) as s:
+        req2 = s.request(kind="http", params={"u": "A"})
+        resp2 = s.fetch(req2)
+        assert resp2.status == ResponseStatus.OK
+        assert dummy_fetcher.calls == 2
+        p2 = Path(resp2.path)
+        assert p2.exists()
+        assert resp2.checksum != resp1.checksum
+
+
 def test_provenance_fields_present(
     tmp_cfg_dataio: MXMConfig,
     store_dataio: Store,
