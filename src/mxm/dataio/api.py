@@ -28,8 +28,8 @@ from pathlib import Path
 from types import TracebackType
 from typing import Mapping, Optional, Type
 
-from mxm.types import JSONLike, JSONObj
 from mxm.config import MXMConfig
+from mxm.types import JSONLike, JSONObj
 
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.cache import CacheStore
@@ -186,6 +186,9 @@ class DataIoSession:
     # ------------------------------------------------------------------ #
     def fetch(self, request: Request) -> Response:
         """Perform a fetch via a Fetcher-capable adapter and persist the Response."""
+
+        # TODO: refactor fetch() into small helpers (ephemeral cache, archive
+        # cache, policy) for readability.
         adapter = resolve_adapter(self.source)
         if not isinstance(adapter, Fetcher):
             raise TypeError(f"Adapter '{self.source}' does not support fetching.")
@@ -212,22 +215,45 @@ class DataIoSession:
                 request_hash=request.hash,
                 as_of_bucket=request.as_of_bucket,
             )
-            if cached_resp is not None:
-                if self.cache_mode == CacheMode.ONLY_IF_CACHED:
-                    # Use it regardless of TTL
-                    return cached_resp
 
-                # DEFAULT / REVALIDATE: enforce TTL if provided
-                if self.ttl is not None:
-                    age = (
-                        datetime.now(timezone.utc) - cached_resp.created_at
-                    ).total_seconds()
-                    if age <= self.ttl:
-                        return cached_resp
-                    # else stale → ignore and refetch
+            if cached_resp is not None:
+                # Cache integrity: do not return archive-cached responses whose payload
+                # file is missing. Treat as cache miss and refetch (append-only audit).
+                payload_ok = True
+                try:
+                    if cached_resp.path is None:
+                        payload_ok = False
+                    else:
+                        p = Path(cached_resp.path)
+                        # Defensive: sentinel paths should not appear for archive
+                        # results.
+                        if str(p).startswith("<") and str(p).endswith(">"):
+                            payload_ok = False
+                        elif not p.exists():
+                            payload_ok = False
+                except Exception:
+                    payload_ok = False
+
+                if not payload_ok:
+                    # Treat as miss: fall through to fetch. (No deletion; audit
+                    # remains append-only.)
+                    cached_resp = None
                 else:
-                    # No TTL → treat as fresh
-                    return cached_resp
+                    if self.cache_mode == CacheMode.ONLY_IF_CACHED:
+                        # Use it regardless of TTL
+                        return cached_resp
+
+                    # DEFAULT / REVALIDATE: enforce TTL if provided
+                    if self.ttl is not None:
+                        age = (
+                            datetime.now(timezone.utc) - cached_resp.created_at
+                        ).total_seconds()
+                        if age <= self.ttl:
+                            return cached_resp
+                        # else stale → ignore and refetch
+                    else:
+                        # No TTL → treat as fresh
+                        return cached_resp
 
         # 3) If ONLY_IF_CACHED and we didn't return above, it's a miss → raise
         if self.cache_mode == CacheMode.ONLY_IF_CACHED:
