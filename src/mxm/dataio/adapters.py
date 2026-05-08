@@ -34,7 +34,8 @@ Example
         def close(self) -> None: ...
 """
 
-from typing import AsyncIterator, Protocol, runtime_checkable
+from collections.abc import AsyncIterator
+from typing import Protocol, runtime_checkable
 
 from mxm.dataio.models import AdapterResult, Request
 

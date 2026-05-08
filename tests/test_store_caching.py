@@ -3,12 +3,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, cast
+from typing import cast
 
 import pytest
-from mxm.config import MXMConfig
 
 import mxm.dataio.api as api_mod  # for monkeypatching resolve_adapter
+from mxm.config import MXMConfig
 from mxm.dataio.adapters import Fetcher
 from mxm.dataio.api import CacheMode, DataIoSession
 from mxm.dataio.cache import FileCacheStore
@@ -21,8 +21,8 @@ from mxm.dataio.store import Store
 @dataclass
 class _CfgPaths:
     root: str
-    db_path: Optional[str] = None
-    responses_dir: Optional[str] = None
+    db_path: str | None = None
+    responses_dir: str | None = None
 
 
 @dataclass
@@ -53,7 +53,7 @@ class DummyFetcher(Fetcher):
     def fetch(self, request: Request) -> AdapterResult:
         _ = request
         self.calls += 1
-        payload = f"payload-{self.calls}".encode("utf-8")
+        payload = f"payload-{self.calls}".encode()
         return AdapterResult(
             data=payload,
             content_type="text/plain",
@@ -299,6 +299,7 @@ def test_missing_archive_payload_is_treated_as_cache_miss_and_reissued(
         resp1 = s.fetch(req)
         assert resp1.status == ResponseStatus.OK
         assert dummy_fetcher.calls == 1
+        assert resp1.path is not None
         p1 = Path(resp1.path)
         assert p1.exists()
 
@@ -318,6 +319,7 @@ def test_missing_archive_payload_is_treated_as_cache_miss_and_reissued(
         resp2 = s.fetch(req2)
         assert resp2.status == ResponseStatus.OK
         assert dummy_fetcher.calls == 2
+        assert resp2.path is not None
         p2 = Path(resp2.path)
         assert p2.exists()
         assert resp2.checksum != resp1.checksum
@@ -328,6 +330,8 @@ def test_provenance_fields_present(
     store_dataio: Store,
     dummy_fetcher: DummyFetcher,
 ) -> None:
+    _ = store_dataio
+    _ = dummy_fetcher
     with _mk_session(
         "dummy",
         tmp_cfg_dataio,
@@ -350,6 +354,7 @@ def test_use_cache_shim(
     store_dataio: Store,
     dummy_fetcher: DummyFetcher,
 ) -> None:
+    _ = store_dataio
     # use_cache=True ⇒ default (reuse)
     with DataIoSession("dummy", tmp_cfg_dataio, use_cache=True, as_of_bucket="S") as s:
         req = s.request(kind="http", params={"u": "A"})
@@ -392,6 +397,7 @@ def test_file_cache_store_short_circuit(
     dummy_fetcher: DummyFetcher,
     tmp_path: Path,
 ) -> None:
+    _ = store_dataio
     fcs = FileCacheStore(tmp_path / "fcs")
 
     # First call fetches and writes-through to archive and file cache
@@ -426,6 +432,8 @@ def test_hash_partitions_on_cache_tag(
     store_dataio: Store,
     dummy_fetcher: DummyFetcher,
 ) -> None:
+    _ = store_dataio
+    _ = dummy_fetcher
     with _mk_session("dummy", tmp_cfg_dataio, as_of_bucket="T", cache_tag="en") as s1:
         r1 = s1.request(kind="http", params={"u": "A"})
     with _mk_session("dummy", tmp_cfg_dataio, as_of_bucket="T", cache_tag="de") as s2:
@@ -438,6 +446,7 @@ def test_cache_isolated_by_cache_tag(
     store_dataio: Store,
     dummy_fetcher: DummyFetcher,
 ) -> None:
+    _ = store_dataio
     # Prime "en"
     with _mk_session(
         "dummy",
@@ -468,6 +477,9 @@ def test_hash_ignores_ttl_and_mode(
     store_dataio: Store,
     dummy_fetcher: DummyFetcher,
 ) -> None:
+    _ = store_dataio
+    _ = dummy_fetcher
+
     with _mk_session(
         "dummy",
         tmp_cfg_dataio,

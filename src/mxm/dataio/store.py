@@ -18,15 +18,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import ClassVar, Final, Generator, Optional
+from typing import ClassVar, Final
 
-from mxm.types import JSONLike, JSONMap
 from mxm.config import MXMConfig
-
 from mxm.dataio.models import Request, Response, Session
+from mxm.types import JSONLike, JSONMap
 
 # --------------------------------------------------------------------------- #
 # Store class
@@ -49,7 +49,7 @@ class Store:
     Everything else in the view is ignored here.
     """
 
-    _instances: ClassVar[dict[str, "Store"]] = {}
+    _instances: ClassVar[dict[str, Store]] = {}
     _lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, cfg: MXMConfig) -> None:
@@ -88,7 +88,7 @@ class Store:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get_instance(cls, cfg: MXMConfig) -> "Store":
+    def get_instance(cls, cfg: MXMConfig) -> Store:
         """
         Return the singleton Store for the given dataio view.
 
@@ -120,7 +120,7 @@ class Store:
     # ------------------------------------------------------------------ #
 
     @contextmanager
-    def connect(self) -> Generator[sqlite3.Connection, None, None]:
+    def connect(self) -> Generator[sqlite3.Connection]:
         """Yield a SQLite connection with automatic commit/rollback."""
         conn = sqlite3.connect(self.db_path)
         try:
@@ -282,9 +282,7 @@ class Store:
     # Caching & lookup
     # --------------------------------------------------------------------- #
 
-    def get_cached_response_by_request_hash(
-        self, request_hash: str
-    ) -> Optional["Response"]:
+    def get_cached_response_by_request_hash(self, request_hash: str) -> Response | None:
         """Return the most recent Response for a previously-seen request hash,
         if any."""
         with self.connect() as conn:
@@ -330,7 +328,7 @@ class Store:
         self,
         request_hash: str,
         as_of_bucket: str | None = None,
-    ) -> Optional["Response"]:
+    ) -> Response | None:
         """Return the most recent Response for a previously-seen request hash
         and bucket.
 

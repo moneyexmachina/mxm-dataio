@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Callable
 from importlib.resources import files as pkg_files  # Python 3.11+
 from pathlib import Path
-from typing import Callable
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch  # type: ignore[import-not-found]

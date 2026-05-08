@@ -10,12 +10,12 @@ from __future__ import annotations
 import concurrent.futures
 import itertools
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from mxm.config import MXMConfig, make_subconfig
 
+from mxm.config import MXMConfig, make_subconfig
 from mxm.dataio.models import Session
 from mxm.dataio.store import Store
 
@@ -128,7 +128,7 @@ def test_indexes_created(store: Store) -> None:
 
 
 def test_store_helpers_end_and_cache(store: Store) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from mxm.dataio.models import (
         Request,
@@ -141,7 +141,7 @@ def test_store_helpers_end_and_cache(store: Store) -> None:
     sess = Session(source="unit")
     store.insert_session(sess)
 
-    end = datetime.now(tz=timezone.utc).replace(microsecond=0)
+    end = datetime.now(tz=UTC).replace(microsecond=0)
     store.mark_session_ended(sess.id, end)
     with store.connect() as conn:
         ended = conn.execute(

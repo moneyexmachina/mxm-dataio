@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from mxm.config import MXMConfig, make_subconfig
 
+from mxm.config import MXMConfig, make_subconfig
 from mxm.dataio.models import Request, Response, ResponseStatus, Session
 from mxm.dataio.store import Store
 

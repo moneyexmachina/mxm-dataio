@@ -4,10 +4,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from mxm.config import DefaultsMode, install_config, load_config
 from omegaconf import DictConfig
 from omegaconf.errors import ReadonlyConfigError
 
+from mxm.config import DefaultsMode, install_config, load_config
 from mxm.dataio.config.config import dataio_view
 
 APP_ID = "dataio"
@@ -85,7 +85,7 @@ def test_dataio_paths_have_core_fields_and_are_readonly(
     assert isinstance(dview.paths.db_path, str) and dview.paths.db_path  # type: ignore[attr-defined]
     assert isinstance(dview.paths.responses_dir, str) and dview.paths.responses_dir  # type: ignore[attr-defined]
 
-    # Composition includes env/profile suffixes (sanity checks – adjust as needed
+    # Composition includes env/profile suffixes (sanity checks - adjust as needed
     # to match your actual YAML structure).
     assert "dev" in dview.paths.root  # type: ignore[attr-defined]
     assert "dataio" in dview.paths.root  # type: ignore[attr-defined]

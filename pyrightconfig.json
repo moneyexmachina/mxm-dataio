@@ -1,0 +1,30 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "strict",
+
+  "reportMissingTypeStubs": false,
+  "reportPrivateUsage": false,
+
+  "include": ["src", "tests"],
+  "exclude": [
+    ".git",
+    ".venv",
+    "dist",
+    "build",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".pyright",
+    "htmlcov",
+    ".ruff_cache",
+    ".cache"
+  ],
+
+  "executionEnvironments": [
+    {
+      "root": "src",
+      "pythonVersion": "3.13"
+    }
+  ]
+}

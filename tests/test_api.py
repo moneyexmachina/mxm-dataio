@@ -5,15 +5,17 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
-from mxm.config import MXMConfig, make_subconfig
 
+from mxm.config import MXMConfig, make_subconfig
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.api import DataIoSession
 from mxm.dataio.models import AdapterResult, Request, RequestMethod, ResponseStatus
 from mxm.dataio.registry import clear_registry, register
 from mxm.dataio.store import Store
+from mxm.types import JSONMap
 
 # --------------------------------------------------------------------------- #
 # Dummy adapters (AdapterResult-based)
@@ -25,7 +27,7 @@ class DummyFetcher(Fetcher):
 
     def fetch(self, request: Request) -> AdapterResult:
         # Deterministic payload tied to request hash
-        payload = f"PAYLOAD:{request.hash}".encode("utf-8")
+        payload = f"PAYLOAD:{request.hash}".encode()
         return AdapterResult(
             data=payload,
             transport_status=200,
@@ -182,9 +184,12 @@ def test_send_persists_ack_and_json_payload(store_cfg_view: MXMConfig) -> None:
     # Sidecar metadata exists and contains adapter meta + content type
     store = Store.get_instance(store_cfg_view)
     meta = store.read_metadata(resp.checksum)
-    assert meta["content_type"] == "application/json"
-    assert meta["adapter_meta"]["ok"] == "1"
-    assert meta["adapter_meta"]["len"] == str(len(b'{"hello":"world"}'))
+    meta = cast(JSONMap, meta)
+    content_type = cast(str, meta["content_type"])
+    assert content_type == "application/json"
+    adapter_meta = cast(JSONMap, meta["adapter_meta"])
+    assert adapter_meta["ok"] == "1"
+    assert adapter_meta["len"] == str(len(b'{"hello":"world"}'))
 
 
 def test_capability_mismatch_raises(store_cfg_view: MXMConfig) -> None:

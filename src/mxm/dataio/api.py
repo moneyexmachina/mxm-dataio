@@ -22,15 +22,13 @@ Notes
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import Mapping, Optional, Type
 
 from mxm.config import MXMConfig
-from mxm.types import JSONLike, JSONObj
-
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.cache import CacheStore
 from mxm.dataio.models import (
@@ -44,6 +42,7 @@ from mxm.dataio.models import (
 )
 from mxm.dataio.registry import resolve_adapter
 from mxm.dataio.store import Store
+from mxm.types import JSONLike, JSONObj
 
 # --------------------------------------------------------------------------- #
 # Cache mode enumeration
@@ -102,14 +101,14 @@ class DataIoSession:
         source: str,
         cfg: MXMConfig,
         *,
-        store: Optional[Store] = None,
-        cache_store: Optional[CacheStore] = None,
+        store: Store | None = None,
+        cache_store: CacheStore | None = None,
         mode: SessionMode = SessionMode.SYNC,
         cache_mode: CacheMode | str = CacheMode.DEFAULT,
         ttl: float | None = None,
         as_of_bucket: str | None = None,
         cache_tag: str | None = None,
-        use_cache: Optional[bool] = None,
+        use_cache: bool | None = None,
     ) -> None:
         self.source = source
         self.cfg = cfg
@@ -125,13 +124,13 @@ class DataIoSession:
         if use_cache is not None:
             self.cache_mode = CacheMode.DEFAULT if use_cache else CacheMode.BYPASS
 
-        self._session: Optional[Session] = None
+        self._session: Session | None = None
 
     # ------------------------------------------------------------------ #
     # Context management
     # ------------------------------------------------------------------ #
 
-    def __enter__(self) -> "DataIoSession":
+    def __enter__(self) -> DataIoSession:
         session = Session(source=self.source, mode=self.mode)
         self.store.insert_session(session)
         self._session = session
@@ -139,9 +138,9 @@ class DataIoSession:
 
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> None:
         _ = (exc_type, exc_val, exc_tb)
         if self._session is None:
@@ -181,116 +180,102 @@ class DataIoSession:
         self.store.insert_request(req)
         return req
 
-    # ------------------------------------------------------------------ #
-    # Capability-dispatched operations
-    # ------------------------------------------------------------------ #
-    def fetch(self, request: Request) -> Response:
-        """Perform a fetch via a Fetcher-capable adapter and persist the Response."""
-
-        # TODO: refactor fetch() into small helpers (ephemeral cache, archive
-        # cache, policy) for readability.
+    def _resolve_fetcher(self) -> Fetcher:
         adapter = resolve_adapter(self.source)
         if not isinstance(adapter, Fetcher):
             raise TypeError(f"Adapter '{self.source}' does not support fetching.")
+        return adapter
 
-        # 1) Try ephemeral cache_store first (if any) and policy allows
-        if self.cache_store is not None and self.cache_mode not in (
-            CacheMode.BYPASS,
-            CacheMode.NEVER,
-        ):
-            cached_bytes = self.cache_store.get(request.hash, ttl=self.ttl)
-            if cached_bytes is not None:
-                # Serve from ephemeral cache without touching archive
-                return Response.from_bytes(
-                    request_id=request.id,
-                    status=ResponseStatus.OK,
-                    data=cached_bytes,
-                    path="<cache>",
-                )
+    def _fetch_cache_allowed(self) -> bool:
+        return self.cache_mode not in (CacheMode.BYPASS, CacheMode.NEVER)
 
-        # 2) Try archive store cache if policy allows
-        cached_resp: Response | None = None
-        if self.cache_mode not in (CacheMode.BYPASS, CacheMode.NEVER):
-            cached_resp = self.store.get_cached_response_by_request_hash_and_bucket(
-                request_hash=request.hash,
-                as_of_bucket=request.as_of_bucket,
-            )
+    def _get_fetch_cache_hit(self, request: Request) -> Response | None:
+        if not self._fetch_cache_allowed():
+            return None
 
-            if cached_resp is not None:
-                # Cache integrity: do not return archive-cached responses whose payload
-                # file is missing. Treat as cache miss and refetch (append-only audit).
-                payload_ok = True
-                try:
-                    if cached_resp.path is None:
-                        payload_ok = False
-                    else:
-                        p = Path(cached_resp.path)
-                        # Defensive: sentinel paths should not appear for archive
-                        # results.
-                        if str(p).startswith("<") and str(p).endswith(">"):
-                            payload_ok = False
-                        elif not p.exists():
-                            payload_ok = False
-                except Exception:
-                    payload_ok = False
+        cached = self._get_ephemeral_cached_response(request)
+        if cached is not None:
+            return cached
 
-                if not payload_ok:
-                    # Treat as miss: fall through to fetch. (No deletion; audit
-                    # remains append-only.)
-                    cached_resp = None
-                else:
-                    if self.cache_mode == CacheMode.ONLY_IF_CACHED:
-                        # Use it regardless of TTL
-                        return cached_resp
+        return self._get_archive_cached_response(request)
 
-                    # DEFAULT / REVALIDATE: enforce TTL if provided
-                    if self.ttl is not None:
-                        age = (
-                            datetime.now(timezone.utc) - cached_resp.created_at
-                        ).total_seconds()
-                        if age <= self.ttl:
-                            return cached_resp
-                        # else stale → ignore and refetch
-                    else:
-                        # No TTL → treat as fresh
-                        return cached_resp
+    def _get_ephemeral_cached_response(self, request: Request) -> Response | None:
+        if self.cache_store is None:
+            return None
 
-        # 3) If ONLY_IF_CACHED and we didn't return above, it's a miss → raise
+        cached_bytes = self.cache_store.get(request.hash, ttl=self.ttl)
+        if cached_bytes is None:
+            return None
+
+        return Response.from_bytes(
+            request_id=request.id,
+            status=ResponseStatus.OK,
+            data=cached_bytes,
+            path="<cache>",
+        )
+
+    def _get_archive_cached_response(self, request: Request) -> Response | None:
+        cached = self.store.get_cached_response_by_request_hash_and_bucket(
+            request_hash=request.hash,
+            as_of_bucket=request.as_of_bucket,
+        )
+        if cached is None:
+            return None
+
+        if not _archive_payload_exists(cached):
+            return None
+
         if self.cache_mode == CacheMode.ONLY_IF_CACHED:
-            miss = f"request hash={request.hash} bucket={request.as_of_bucket!r}"
-            raise RuntimeError(f"Cache miss for {miss}")
+            return cached
 
-        # 4) Policy requires a fresh fetch (BYPASS/NEVER or stale/miss)
-        result: AdapterResult = adapter.fetch(request)
+        if self.ttl is None:
+            return cached
 
-        # Write-through to ephemeral cache (if present and allowed)
-        if self.cache_store is not None and self.cache_mode not in (
-            CacheMode.NEVER,
-            CacheMode.ONLY_IF_CACHED,
-        ):
-            try:
-                self.cache_store.put(request.hash, result.data)
-            except Exception:
-                # Cache is best-effort; don't fail the fetch path
-                pass
+        age = (datetime.now(UTC) - cached.created_at).total_seconds()
+        if age <= self.ttl:
+            return cached
 
-        # Build Response and persist to archive unless policy says NEVER
-        if self.cache_mode == CacheMode.NEVER:
-            # Ephemeral-only response; don't write bytes/metadata/row to archive
-            resp = Response.from_adapter_result(
-                request_id=request.id,
-                status=ResponseStatus.OK,
-                result=result,
-                path="<ephemeral>",
-                sequence=None,
-            )
-            resp.cache_mode = self.cache_mode.value
-            resp.ttl_seconds = self.ttl
-            resp.as_of_bucket = request.as_of_bucket
-            resp.cache_tag = request.cache_tag
-            return resp
+        return None
 
-        # Normal archival persistence
+    def _write_through_ephemeral_cache(
+        self,
+        request: Request,
+        result: AdapterResult,
+    ) -> None:
+        if self.cache_store is None:
+            return
+
+        if self.cache_mode in (CacheMode.NEVER, CacheMode.ONLY_IF_CACHED):
+            return
+
+        try:
+            self.cache_store.put(request.hash, result.data)
+        except Exception:
+            pass
+
+    def _build_ephemeral_fetch_response(
+        self,
+        request: Request,
+        result: AdapterResult,
+    ) -> Response:
+        resp = Response.from_adapter_result(
+            request_id=request.id,
+            status=ResponseStatus.OK,
+            result=result,
+            path="<ephemeral>",
+            sequence=None,
+        )
+        resp.cache_mode = self.cache_mode.value
+        resp.ttl_seconds = self.ttl
+        resp.as_of_bucket = request.as_of_bucket
+        resp.cache_tag = request.cache_tag
+        return resp
+
+    def _persist_fetch_response(
+        self,
+        request: Request,
+        result: AdapterResult,
+    ) -> Response:
         resp = persist_result_as_response(
             store=self.store,
             request_id=request.id,
@@ -303,6 +288,29 @@ class DataIoSession:
         )
         self.store.insert_response(resp)
         return resp
+
+    # ------------------------------------------------------------------ #
+    # Capability-dispatched operations
+    # ------------------------------------------------------------------ #
+    def fetch(self, request: Request) -> Response:
+        """Perform a fetch via a Fetcher-capable adapter and persist the Response."""
+        adapter = self._resolve_fetcher()
+
+        cached = self._get_fetch_cache_hit(request)
+        if cached is not None:
+            return cached
+
+        if self.cache_mode == CacheMode.ONLY_IF_CACHED:
+            miss = f"request hash={request.hash} bucket={request.as_of_bucket!r}"
+            raise RuntimeError(f"Cache miss for {miss}")
+
+        result = adapter.fetch(request)
+        self._write_through_ephemeral_cache(request, result)
+
+        if self.cache_mode == CacheMode.NEVER:
+            return self._build_ephemeral_fetch_response(request, result)
+
+        return self._persist_fetch_response(request, result)
 
     def send(
         self,
@@ -356,7 +364,7 @@ class DataIoSession:
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _maybe_get_cached_response(self, request: Request) -> Optional[Response]:
+    def _maybe_get_cached_response(self, request: Request) -> Response | None:
         """Return the newest cached Response for this request hash/bucket."""
         try:
             return self.store.get_cached_response_by_request_hash_and_bucket(
@@ -403,6 +411,18 @@ def persist_result_as_response(
     resp.as_of_bucket = as_of_bucket
     resp.cache_tag = cache_tag
     return resp
+
+
+def _archive_payload_exists(response: Response) -> bool:
+    if response.path is None:
+        return False
+
+    path = Path(response.path)
+
+    if str(path).startswith("<") and str(path).endswith(">"):
+        return False
+
+    return path.exists()
 
 
 def _ensure_bytes(payload: bytes | Mapping[str, JSONLike]) -> bytes:

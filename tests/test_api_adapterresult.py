@@ -7,8 +7,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from mxm.config import MXMConfig, make_subconfig
 
+from mxm.config import MXMConfig, make_subconfig
 from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.api import DataIoSession
 from mxm.dataio.models import AdapterResult, Request, RequestMethod, ResponseStatus
@@ -26,7 +26,7 @@ class FetcherWithMeta(Fetcher):
     source = "fetch_meta"
 
     def fetch(self, request: Request) -> AdapterResult:
-        data = f"F-META:{request.hash}".encode("utf-8")
+        data = f"F-META:{request.hash}".encode()
         return AdapterResult(
             data=data,
             content_type="application/octet-stream",

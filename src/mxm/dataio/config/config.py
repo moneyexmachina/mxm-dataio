@@ -1,7 +1,7 @@
 """
 Config access helpers for mxm-dataio.
 
-This module provides **focused, read-only views** over the package’s config
+This module provides **focused, read-only views** over the package's config
 subtrees, built on top of `mxm_config.make_view`. It intentionally performs
 no I/O at import time—callers should obtain a global `MXMConfig` via
 `mxm_config.load_config(...)` and then pass that object to the helpers here.

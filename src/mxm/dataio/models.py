@@ -29,7 +29,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 
 from mxm.types import HeadersLike, JSONLike, JSONMap, JSONObj
@@ -41,7 +41,7 @@ from mxm.types import HeadersLike, JSONLike, JSONMap, JSONObj
 
 def _utcnow() -> datetime:
     """Return the current UTC timestamp with explicit tzinfo."""
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _uuid() -> str:
@@ -152,7 +152,7 @@ class Request:
         }
         serialized = _json_dumps(base)
         self.hash = hashlib.sha256(
-            f"{self.kind}:{self.method}:{serialized}".encode("utf-8")
+            f"{self.kind}:{self.method}:{serialized}".encode()
         ).hexdigest()
 
     def to_json(self) -> str:

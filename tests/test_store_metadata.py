@@ -6,9 +6,10 @@ import json
 from pathlib import Path
 
 import pytest
-from mxm.config import MXMConfig, make_subconfig
 
+from mxm.config import MXMConfig, make_subconfig
 from mxm.dataio.store import Store
+from mxm.types import JSONMap
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -46,7 +47,11 @@ def test_write_and_read_metadata_roundtrip(store: Store) -> None:
     path = store.write_payload(data)
     checksum = path.stem
 
-    meta_in = {"content_type": "application/json", "status": 200, "elapsed_ms": 12}
+    meta_in: JSONMap = {
+        "content_type": "application/json",
+        "status": 200,
+        "elapsed_ms": 12,
+    }
     meta_path = store.write_metadata(checksum, meta_in)
     assert meta_path.exists()
 
@@ -59,12 +64,12 @@ def test_write_metadata_is_idempotent_no_overwrite(store: Store) -> None:
     checksum = store.write_payload(data).stem
 
     # First write
-    first_meta = {"a": 1}
+    first_meta: JSONMap = {"a": 1}
     meta_path = store.write_metadata(checksum, first_meta)
     text1 = meta_path.read_text(encoding="utf-8")
 
     # Second write with different content should not overwrite existing file
-    second_meta = {"a": 2, "b": 3}
+    second_meta: JSONMap = {"a": 2, "b": 3}
     meta_path2 = store.write_metadata(checksum, second_meta)
     assert meta_path2 == meta_path
     text2 = meta_path.read_text(encoding="utf-8")
@@ -83,7 +88,7 @@ def test_metadata_filename_matches_checksum(store: Store) -> None:
     data = b"abc"
     checksum = store.write_payload(data).stem
 
-    meta = {"ok": True}
+    meta: JSONMap = {"ok": True}
     meta_path = store.write_metadata(checksum, meta)
 
     expected = store.responses_dir / f"{checksum}.meta.json"
@@ -96,7 +101,7 @@ def test_metadata_unicode_and_deterministic_json(store: Store) -> None:
     checksum = store.write_payload(data).stem
 
     # Note: keys will be sorted and JSON minified
-    meta = {"zeta": "Ωmega", "alpha": "äöü"}
+    meta: JSONMap = {"zeta": "Ωmega", "alpha": "äöü"}
     meta_path = store.write_metadata(checksum, meta)
 
     # Verify deterministic serialization (sorted keys, minified spacing)

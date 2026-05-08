@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -53,7 +53,7 @@ class CacheStore(Protocol):
     Concurrency, locking, and eviction policies are implementation-defined.
     """
 
-    def get(self, key: str, ttl: float | None = None) -> Optional[bytes]:
+    def get(self, key: str, ttl: float | None = None) -> bytes | None:
         """Return cached bytes if present and within TTL; else None.
 
         Parameters
@@ -100,7 +100,7 @@ class FileCacheStore:
         # Avoid path traversal risk by restricting to a simple filename scheme.
         return self.cache_dir / f"{key}.bin"
 
-    def get(self, key: str, ttl: float | None = None) -> Optional[bytes]:
+    def get(self, key: str, ttl: float | None = None) -> bytes | None:
         path = self._path(key)
         if not path.exists():
             return None

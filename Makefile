@@ -1,37 +1,69 @@
-# Makefile for mxm-dataio (Poetry-based)
+# managed: mxm-foundry:begin make v1
+# Default to showing help
+.DEFAULT_GOAL := help
 
-.PHONY: help test test-all lint type check format
+POETRY ?= poetry
+RUN     = $(POETRY) run
 
-# Default target
+.PHONY: help install lock fmt lint type test check build clean \
+        deps.outdated deps.update-dev deps.bump-dev ci publish
+
 help:
-	@echo "Available targets:"
-	@echo "  make test      - run fast unit tests only (excludes integration/slow)"
-	@echo "  make test-all  - run full pytest suite (unit + integration + slow)"
-	@echo "  make lint      - run ruff lint + format check"
-	@echo "  make format    - auto-format code with ruff"
-	@echo "  make type      - run pyright type checker"
-	@echo "  make check     - run lint + type + unit tests"
+	@echo "Common targets:"
+	@echo "  install        - poetry install (sync lock)"
+	@echo "  lock           - refresh lockfile (no version bumps)"
+	@echo "  fmt            - ruff --fix, black, isort"
+	@echo "  lint           - ruff, black --check, isort --check-only"
+	@echo "  type           - pyright (strict by default)"
+	@echo "  test           - pytest"
+	@echo "  check          - lint + type + test"
+	@echo "  deps.outdated  - list outdated deps (incl. dev)"
+	@echo "  deps.update-dev- update dev deps within constraints"
+	@echo "  deps.bump-dev  - bump dev tool constraints to latest"
+	@echo "  build          - poetry build"
+	@echo "  clean          - remove build/type/test artifacts"
+	@echo "  ci             - alias for 'check'"
+	@echo "  publish        - placeholder; use 'poetry publish' or GH release"
 
-# Fast feedback: unit tests only
-test:
-	poetry run pytest -m "not integration and not slow" -ra -q
+install:
+	$(POETRY) install --sync
 
-# Full suite: includes integration and slow
-test-all:
-	poetry run pytest -ra -q
+lock:
+	$(POETRY) lock --no-update
 
-# Lint with ruff (style + errors) and check formatting
+fmt:
+	$(RUN) ruff check . --fix
+	$(RUN) black .
+	$(RUN) isort .
+
 lint:
-	poetry run ruff check .
-	poetry run ruff format --check .
+	$(RUN) ruff check .
+	$(RUN) black --check .
+	$(RUN) isort --check-only .
 
-# Auto-format code with ruff
-format:
-	poetry run ruff format .
-
-# Static type checking with pyright
 type:
-	poetry run pyright
+	$(RUN) pyright
 
-# Pre-commit check: lint + type + unit tests
+test:
+	$(RUN) pytest -q
+
 check: lint type test
+
+ci: check
+
+deps.outdated:
+	$(POETRY) show --outdated
+
+deps.update-dev:
+	$(POETRY) update --group dev
+
+# Bump dev tool constraints to latest stable (and update lock)
+deps.bump-dev:
+	$(POETRY) add --group dev black@latest isort@latest ruff@latest pyright@latest pytest@latest
+
+build:
+	$(POETRY) build
+
+clean:
+	rm -rf dist build .pytest_cache .coverage htmlcov .pyright .ruff_cache *.egg-info
+# end: mxm-foundry:end

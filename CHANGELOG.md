@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
+## Unreleased
+
+## [0.4.2] — 2026-05-07
+
+### Changed
+- Updated dependencies to latest MXM releases:
+  - `mxm-config >= 0.5.2`
+  - `mxm-types >= 0.2.1`
+- Aligned project structure and configuration with `mxm-foundry` package policy:
+  - Adopted PEP 420 namespace package layout (`src/mxm` without `__init__.py`)
+  - Updated Poetry package declaration to use MXM namespace root:
+    - `packages = [{ include = "mxm", from = "src" }]`
+- Simplified tooling configuration to match canonical MXM defaults:
+  - Removed non-canonical Ruff configuration (`exclude`)
+  - Simplified `isort` configuration
+
+### Fixed
+- Ensured full compliance with `mxm-foundry check` across:
+  - filesystem structure
+  - `pyproject.toml` configuration
+  - formatting and typing policy
+  - documentation requirements (`README.md`, `CHANGELOG.md`)
+
+### Documentation
+- Updated `README.md` to conform to MXM documentation policy:
+  - Added required sections: `## Purpose`, `## Installation`, `## Usage`, `## Development`
+  - Standardised development workflow around `make check`
+
+### Notes
+- No changes to public API or runtime behaviour.
+- This release is a structural and tooling compliance update aligning `mxm-dataio` with the MXM package standard.
+
 ## [0.4.1] – 2026-01-21
 
 ### Fixed
