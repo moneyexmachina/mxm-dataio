@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.4.2"
+version = "0.4.3"
 description = "**Unified ingestion, caching, and audit layer for Money Ex Machina.**"
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
@@ -17,7 +17,7 @@ classifiers = ["Typing :: Typed"]
 [tool.poetry.dependencies]
 python = ">=3.13, <3.15"
 mxm-config = ">=0.5.2" 
-mxm-types = ">=0.2.1"
+mxm-types = ">=0.2.2"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

@@ -5,7 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
 ## Unreleased
+## [0.4.3] - 2026-05-12
 
+### Changed
+
+- Updated `mxm-types` dependency from:
+  ```toml
+  mxm-types = "^0.2.1"
+  ```
+  to:
+  ```toml
+  mxm-types = "^0.2.2"
+  ```
+
+### Fixed
+
+- Restored compatibility with the synchronized MXM dependency baseline.
+- Eliminated transitive dependency conflicts related to pandas version constraints during Poetry resolution.
+
+### Notes
+
+- This release aligns `mxm-dataio` with the updated `mxm-types` pandas compatibility policy.
+- No functional runtime behavior changes are intended.
+- This release is part of the broader MXM ecosystem stabilization and publication effort during Session 43.
 ## [0.4.2] — 2026-05-07
 
 ### Changed
