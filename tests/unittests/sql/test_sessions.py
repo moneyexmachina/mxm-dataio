@@ -9,7 +9,7 @@ from typing import Literal, Self, cast
 import pytest
 from psycopg import Connection, sql
 
-from mxm.dataio.models import Session, SessionMode
+from mxm.dataio.models import CacheMode, Session, SessionMode
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.sessions import (
     SessionConflictError,
@@ -147,15 +147,19 @@ def _as_connection(
 # ---------------------------------------------------------------------------
 
 
-_STARTED_AT = datetime(2026, 9, 2, 9, 0, tzinfo=UTC)
-_ENDED_AT = datetime(2026, 9, 2, 9, 30, tzinfo=UTC)
+_STARTED_AT = datetime(2026, 9, 3, 9, 0, tzinfo=UTC)
+_ENDED_AT = datetime(2026, 9, 3, 9, 30, tzinfo=UTC)
 
 
 def _session(
     *,
     session_id: str = "session-1",
     source: str = "example-source",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     mode: SessionMode = SessionMode.SYNC,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
     started_at: datetime = _STARTED_AT,
     ended_at: datetime | None = None,
 ) -> Session:
@@ -164,7 +168,11 @@ def _session(
     return Session(
         id=session_id,
         source=source,
+        cache_mode=cache_mode,
         mode=mode,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         started_at=started_at,
         ended_at=ended_at,
     )
@@ -173,12 +181,16 @@ def _session(
 def _session_row(
     session: Session,
 ) -> PostgresRow:
-    """Encode one session as a PostgreSQL result row."""
+    """Encode one Session as a PostgreSQL result row."""
 
     return (
         session.id,
         session.source,
         session.mode.value,
+        session.cache_mode.value,
+        session.ttl_seconds,
+        session.as_of_bucket,
+        session.cache_tag,
         session.started_at,
         session.ended_at,
     )
@@ -259,12 +271,44 @@ def test_fetch_session_by_id_returns_none_when_absent() -> None:
     assert connection.cursor_calls == 1
 
 
-def test_fetch_session_by_id_reconstructs_session() -> None:
-    """A persisted row reconstructs the complete Session object."""
+def test_fetch_session_by_id_reconstructs_complete_session() -> None:
+    """A persisted row reconstructs lifecycle and handling context."""
 
     expected = _session(
+        cache_mode=CacheMode.REVALIDATE,
         mode=SessionMode.BATCH,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v2",
         ended_at=_ENDED_AT,
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    _session_row(expected),
+                ]
+            ),
+        ]
+    )
+
+    session = fetch_session_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        session_id=expected.id,
+    )
+
+    assert session == expected
+
+
+def test_fetch_session_by_id_reconstructs_absent_optional_context() -> None:
+    """Nullable handling-context fields reconstruct as None."""
+
+    expected = _session(
+        ttl_seconds=None,
+        as_of_bucket=None,
+        cache_tag=None,
     )
 
     connection = FakeConnection(
@@ -417,18 +461,66 @@ _SESSION_ROW = _session_row(_session())
             _row_with_value(
                 _SESSION_ROW,
                 3,
-                "2026-09-02T09:00:00Z",
+                "unknown-cache-mode",
+            ),
+            r"cache_mode is not recognised",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                4,
+                -1.0,
+            ),
+            r"ttl_seconds must be a finite non-negative number",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                4,
+                float("inf"),
+            ),
+            r"ttl_seconds must be a finite non-negative number",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                4,
+                True,
+            ),
+            r"ttl_seconds must be a finite non-negative number",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                5,
+                123,
+            ),
+            r"as_of_bucket must be text or NULL",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                6,
+                123,
+            ),
+            r"cache_tag must be text or NULL",
+        ),
+        (
+            _row_with_value(
+                _SESSION_ROW,
+                7,
+                "2026-09-03T09:00:00Z",
             ),
             r"started_at must be a datetime",
         ),
         (
             _row_with_value(
                 _SESSION_ROW,
-                3,
+                7,
                 datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     9,
                     0,
                 ),
@@ -438,19 +530,19 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
-                "2026-09-02T09:30:00Z",
+                8,
+                "2026-09-03T09:30:00Z",
             ),
             r"ended_at must be a datetime",
         ),
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
+                8,
                 datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     9,
                     30,
                 ),
@@ -460,11 +552,11 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
+                8,
                 datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     8,
                     59,
                     tzinfo=UTC,
@@ -628,10 +720,14 @@ def test_fetch_latest_session_id_rejects_invalid_result(
 
 
 def test_insert_session_encodes_complete_session_state() -> None:
-    """One Session is encoded into the expected SQL values."""
+    """One Session is encoded with lifecycle and handling context."""
 
     session = _session(
+        cache_mode=CacheMode.REVALIDATE,
         mode=SessionMode.ASYNC,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v2",
         ended_at=_ENDED_AT,
     )
 
@@ -662,6 +758,10 @@ def test_insert_session_encodes_complete_session_state() -> None:
         session.id,
         session.source,
         session.mode.value,
+        session.cache_mode.value,
+        session.ttl_seconds,
+        session.as_of_bucket,
+        session.cache_tag,
         session.started_at,
         session.ended_at,
     )
@@ -694,14 +794,16 @@ def test_insert_session_accepts_matching_persisted_state() -> None:
     assert "SELECT" in _query_text(connection.executions[1].query)
 
 
-def test_insert_session_rejects_conflicting_persisted_state() -> None:
-    """One session ID cannot identify different session state."""
+def test_insert_session_rejects_conflicting_handling_context() -> None:
+    """One session ID cannot identify different handling context."""
 
-    requested = _session()
+    requested = _session(
+        cache_mode=CacheMode.DEFAULT,
+    )
 
     persisted = replace(
         requested,
-        source="different-source",
+        cache_mode=CacheMode.BYPASS,
     )
 
     connection = FakeConnection(
@@ -756,19 +858,35 @@ def test_insert_session_rejects_missing_state_after_insert() -> None:
     ),
     [
         (
-            _session(session_id=""),
+            _session(
+                session_id="",
+            ),
             r"id must be non-empty text",
         ),
         (
-            _session(source=""),
+            _session(
+                source="",
+            ),
             r"source must be non-empty text",
+        ),
+        (
+            _session(
+                ttl_seconds=-1.0,
+            ),
+            r"ttl_seconds must be a finite non-negative number",
+        ),
+        (
+            _session(
+                ttl_seconds=float("inf"),
+            ),
+            r"ttl_seconds must be a finite non-negative number",
         ),
         (
             _session(
                 started_at=datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     9,
                     0,
                 ),
@@ -780,7 +898,7 @@ def test_insert_session_rejects_missing_state_after_insert() -> None:
                 ended_at=datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     9,
                     30,
                 ),
@@ -792,7 +910,7 @@ def test_insert_session_rejects_missing_state_after_insert() -> None:
                 ended_at=datetime(
                     2026,
                     9,
-                    2,
+                    3,
                     8,
                     59,
                     tzinfo=UTC,
@@ -832,7 +950,12 @@ def test_insert_session_rejects_invalid_state_before_sql(
 def test_mark_session_ended_records_completion() -> None:
     """An open persisted session can be completed once."""
 
-    open_session = _session()
+    open_session = _session(
+        cache_mode=CacheMode.REVALIDATE,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v2",
+    )
 
     ended_session = replace(
         open_session,
@@ -917,7 +1040,7 @@ def test_mark_session_ended_rejects_different_existing_completion() -> None:
     existing_end = datetime(
         2026,
         9,
-        2,
+        3,
         9,
         20,
         tzinfo=UTC,
@@ -980,7 +1103,7 @@ def test_mark_session_ended_rejects_completion_before_start() -> None:
     invalid_end = datetime(
         2026,
         9,
-        2,
+        3,
         8,
         59,
         tzinfo=UTC,
@@ -1026,7 +1149,7 @@ def test_mark_session_ended_rejects_naive_timestamp_before_sql() -> None:
             ended_at=datetime(
                 2026,
                 9,
-                2,
+                3,
                 9,
                 30,
             ),

@@ -100,6 +100,13 @@ class ResponseStatus(str, Enum):
     NACK = "nack"
 
 
+class ResolutionKind(str, Enum):
+    """How one request occurrence was satisfied."""
+
+    ACQUIRED = "acquired"
+    REUSED = "reused"
+
+
 # --------------------------------------------------------------------------- #
 # Dataclasses
 # --------------------------------------------------------------------------- #
@@ -110,7 +117,13 @@ class Session:
     """Logical ingestion or I/O session grouping multiple requests."""
 
     source: str
+    cache_mode: CacheMode
     mode: SessionMode = SessionMode.SYNC
+
+    ttl_seconds: float | None = None
+    as_of_bucket: str | None = None
+    cache_tag: str | None = None
+
     id: str = field(default_factory=_uuid)
     started_at: datetime = field(default_factory=_utcnow)
     ended_at: datetime | None = None
@@ -120,36 +133,46 @@ class Session:
         self.ended_at = _utcnow()
 
 
+dataclass(frozen=True, slots=True)
+
+
 @dataclass(frozen=True, slots=True)
 class Request:
-    """One immutable occurrence of an external I/O request."""
+    """One immutable occurrence of an external I/O question.
+
+    ``id`` identifies this individual request occurrence.
+
+    ``session_id`` identifies the DataIO Session under whose source and
+    handling context the request was made.
+
+    ``hash`` identifies the question itself. It is derived only from the
+    question-bearing fields: ``kind``, ``method``, ``params``, and ``body``.
+
+    Session-owned context such as source, cache policy, TTL, as-of bucket,
+    and cache tag deliberately does not participate in this hash. Those values
+    are considered separately when DataIO determines whether an existing
+    observation is eligible for reuse.
+    """
 
     session_id: str
-    source: str
     kind: str
-    cache_mode: CacheMode
 
     method: RequestMethod = RequestMethod.GET
     params: JSONObj | None = None
     body: JSONLike | None = None
+
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=_utcnow)
-    ttl_seconds: float | None = None
-    as_of_bucket: str | None = None
-    cache_tag: str | None = None
     hash: str = field(init=False)
 
     def __post_init__(self) -> None:
-        """Compute the deterministic logical-request identity."""
+        """Compute the deterministic question identity."""
 
         base: JSONLike = {
-            "source": self.source,
             "kind": self.kind,
             "method": self.method.value,
             "params": self.params,
             "body": self.body,
-            "as_of_bucket": self.as_of_bucket,
-            "cache_tag": self.cache_tag,
         }
 
         object.__setattr__(
@@ -157,6 +180,37 @@ class Request:
             "hash",
             hashlib.sha256(_json_dumps(base).encode()).hexdigest(),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Resolution:
+    """Immutable record of how one Request occurrence was satisfied.
+
+    ``request_id`` identifies the Request occurrence being resolved.
+
+    ``response_id`` identifies the external Response observation whose result
+    satisfied that Request.
+
+    ``kind`` records whether that observation was newly acquired for this
+    Request or reused from an earlier acquisition.
+
+    One Request occurrence has at most one final Resolution. Accordingly,
+    ``request_id`` is sufficient as the persistence identity; Resolution does
+    not require a separate generated ID.
+
+    For an acquired Resolution, the referenced Response is produced by the
+    same Request occurrence.
+
+    For a reused Resolution, the referenced Response was produced by an
+    earlier Request occurrence and is reused without fabricating a new
+    external observation.
+    """
+
+    request_id: str
+    response_id: str
+    kind: ResolutionKind
+
+    resolved_at: datetime = field(default_factory=_utcnow)
 
 
 @dataclass(frozen=True, slots=True)

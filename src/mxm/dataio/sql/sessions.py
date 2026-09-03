@@ -3,8 +3,11 @@
 This module owns the PostgreSQL representation of ``Session`` objects.
 
 A session is an operational grouping of request occurrences for one external
-source. It does not define temporal semantics for the observations collected
-within it.
+source. It also records the effective DataIO handling context under which those
+requests are resolved: cache policy, TTL, and opaque reuse-context
+discriminators.
+
+It does not define temporal semantics for the observations collected within it.
 
 All functions operate on a caller-provided Psycopg connection. They do not
 open, commit, or roll back transactions. Transaction ownership belongs to the
@@ -13,11 +16,12 @@ higher-level DataIO operation.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from psycopg import Connection, sql
 
-from mxm.dataio.models import Session, SessionMode
+from mxm.dataio.models import CacheMode, Session, SessionMode
 from mxm.dataio.sql.postgres import PostgresRow
 
 type ExecutableQuery = sql.SQL | sql.Composed
@@ -60,13 +64,16 @@ def fetch_session_by_id(
         session_id,
         field="session_id",
     )
-
     query = sql.SQL(
         """
         SELECT
             id,
             source,
             mode,
+            cache_mode,
+            ttl_seconds,
+            as_of_bucket,
+            cache_tag,
             started_at,
             ended_at
         FROM {}
@@ -78,7 +85,6 @@ def fetch_session_by_id(
             "sessions",
         )
     )
-
     rows = _fetch_rows(
         connection,
         query,
@@ -201,17 +207,24 @@ def insert_session(
     """
 
     _validate_session(session)
-
     query = sql.SQL(
         """
         INSERT INTO {} (
             id,
             source,
             mode,
+            cache_mode,
+            ttl_seconds,
+            as_of_bucket,
+            cache_tag,
             started_at,
             ended_at
         )
         VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
             %s,
             %s,
             %s,
@@ -226,7 +239,6 @@ def insert_session(
             "sessions",
         )
     )
-
     with connection.cursor() as cursor:
         cursor.execute(
             query,
@@ -234,6 +246,10 @@ def insert_session(
                 session.id,
                 session.source,
                 session.mode.value,
+                session.cache_mode.value,
+                session.ttl_seconds,
+                session.as_of_bucket,
+                session.cache_tag,
                 session.started_at,
                 session.ended_at,
             ),
@@ -409,7 +425,7 @@ def _session_from_row(
 ) -> Session:
     """Reconstruct one validated session from a database row."""
 
-    if len(row) != 5:
+    if len(row) != 9:
         raise SessionPersistenceError(
             f"Session query returned an unexpected row shape: {row!r}"
         )
@@ -429,13 +445,33 @@ def _session_from_row(
         field="mode",
     )
 
-    started_at = _require_datetime(
+    cache_mode_text = _require_text(
         row[3],
+        field="cache_mode",
+    )
+
+    ttl_seconds = _optional_non_negative_float(
+        row[4],
+        field="ttl_seconds",
+    )
+
+    as_of_bucket = _optional_text(
+        row[5],
+        field="as_of_bucket",
+    )
+
+    cache_tag = _optional_text(
+        row[6],
+        field="cache_tag",
+    )
+
+    started_at = _require_datetime(
+        row[7],
         field="started_at",
     )
 
     ended_at = _optional_datetime(
-        row[4],
+        row[8],
         field="ended_at",
     )
 
@@ -447,15 +483,23 @@ def _session_from_row(
         ) from err
 
     try:
-        session = Session(
-            id=session_id,
-            source=source,
-            mode=mode,
-            started_at=started_at,
-            ended_at=ended_at,
-        )
+        cache_mode = CacheMode(cache_mode_text)
     except ValueError as err:
-        raise SessionPersistenceError(f"Persisted session is invalid: {row!r}") from err
+        raise SessionPersistenceError(
+            f"Persisted session cache_mode is not recognised: {cache_mode_text!r}"
+        ) from err
+
+    session = Session(
+        id=session_id,
+        source=source,
+        mode=mode,
+        cache_mode=cache_mode,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
+        started_at=started_at,
+        ended_at=ended_at,
+    )
 
     _validate_session(session)
 
@@ -480,6 +524,21 @@ def _validate_session(
     _validate_identifier(
         session.source,
         field="source",
+    )
+
+    _validate_optional_non_negative_float(
+        session.ttl_seconds,
+        field="ttl_seconds",
+    )
+
+    _validate_optional_text(
+        session.as_of_bucket,
+        field="as_of_bucket",
+    )
+
+    _validate_optional_text(
+        session.cache_tag,
+        field="cache_tag",
     )
 
     _validate_datetime(
@@ -602,3 +661,80 @@ def _optional_datetime(
         value,
         field=field,
     )
+
+
+def _validate_optional_non_negative_float(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    """Require a finite non-negative numeric value or NULL."""
+
+    if value is None:
+        return
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise SessionPersistenceError(
+            f"Session {field} must be a finite non-negative number or NULL, "
+            f"got {value!r}"
+        )
+
+
+def _optional_non_negative_float(
+    value: object,
+    *,
+    field: str,
+) -> float | None:
+    """Require a persisted finite non-negative numeric value or NULL."""
+
+    if value is None:
+        return None
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise SessionPersistenceError(
+            f"Persisted session {field} must be a finite non-negative number "
+            f"or NULL, got {value!r}"
+        )
+
+    return float(value)
+
+
+def _validate_optional_text(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    """Require text or NULL."""
+
+    if value is not None and not isinstance(value, str):
+        raise SessionPersistenceError(
+            f"Session {field} must be text or NULL, got {value!r}"
+        )
+
+
+def _optional_text(
+    value: object,
+    *,
+    field: str,
+) -> str | None:
+    """Require persisted text or NULL."""
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise SessionPersistenceError(
+            f"Persisted session {field} must be text or NULL, got {value!r}"
+        )
+
+    return value

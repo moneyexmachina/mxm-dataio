@@ -48,14 +48,30 @@ def _session(
     *,
     session_id: str,
     source: str = "test-source",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
+    mode: SessionMode = SessionMode.SYNC,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
 ) -> Session:
-    """Construct one deterministic parent DataIO session."""
+    """Construct one deterministic parent DataIO Session."""
 
     return Session(
         id=session_id,
         source=source,
-        mode=SessionMode.SYNC,
-        started_at=datetime(2026, 9, 3, 8, 0, tzinfo=UTC),
+        cache_mode=cache_mode,
+        mode=mode,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
+        started_at=datetime(
+            2026,
+            9,
+            3,
+            8,
+            0,
+            tzinfo=UTC,
+        ),
     )
 
 
@@ -63,20 +79,24 @@ def _request(
     *,
     request_id: str,
     session_id: str,
-    source: str = "test-source",
 ) -> Request:
     """Construct one deterministic parent request occurrence."""
 
     return Request(
         id=request_id,
         session_id=session_id,
-        source=source,
         kind="prices",
-        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },
-        created_at=datetime(2026, 9, 3, 8, 1, tzinfo=UTC),
+        created_at=datetime(
+            2026,
+            9,
+            3,
+            8,
+            1,
+            tzinfo=UTC,
+        ),
     )
 
 
@@ -99,8 +119,23 @@ def _response(
         request_id=request_id,
         status=status,
         sequence=sequence,
-        created_at=datetime(2026, 9, 3, 8, 2, tzinfo=UTC),
-        fetched_at=datetime(2026, 9, 3, 8, 2, 1, tzinfo=UTC),
+        created_at=datetime(
+            2026,
+            9,
+            3,
+            8,
+            2,
+            tzinfo=UTC,
+        ),
+        fetched_at=datetime(
+            2026,
+            9,
+            3,
+            8,
+            2,
+            1,
+            tzinfo=UTC,
+        ),
         payload_checksum=_checksum(
             payload,
         ),
@@ -150,6 +185,11 @@ def test_response_round_trips_through_postgres(
 
     session = _session(
         session_id="session-response-round-trip",
+        source="example-source",
+        cache_mode=CacheMode.REVALIDATE,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03T08",
+        cache_tag="vendor-v1",
     )
 
     request = _request(
@@ -231,6 +271,9 @@ def test_distinct_observations_can_share_payload_identity(
         request_id=second_request.id,
         payload=payload,
     )
+
+    assert first_request.id != second_request.id
+    assert first_request.hash == second_request.hash
 
     assert first_response.id != second_response.id
     assert first_response.payload_checksum == second_response.payload_checksum

@@ -45,12 +45,17 @@ type:
 	$(RUN) pyright
 
 test:
-	$(RUN) pytest -q -m "not postgres"
+	$(RUN) pytest -q -m "not postgres and not s3"
 
 test-postgres:
 	@docker info >/dev/null 2>&1 || \
 		(echo "Docker is required for PostgreSQL integration tests." && exit 1)
 	poetry run pytest -q -m postgres
+test-s3:
+	@docker info >/dev/null 2>&1 || \
+		(echo "Docker is required for S3-compatible object-store integration tests." && exit 1)
+	poetry run pytest -q -m s3
+
 check: lint type test
 
 ci: check

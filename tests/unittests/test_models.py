@@ -8,107 +8,120 @@ from mxm.dataio.models import (
     CacheMode,
     Request,
     RequestMethod,
+    Resolution,
+    ResolutionKind,
     Response,
     ResponseStatus,
     Session,
     SessionMode,
 )
-from mxm.types import JSONObj
+from mxm.types import JSONLike, JSONObj
 
 
 def _request(
     *,
-    source: str = "example-source",
     session_id: str = "s1",
     kind: str = "fetch",
-    cache_mode: CacheMode = CacheMode.DEFAULT,
+    method: RequestMethod = RequestMethod.GET,
     params: JSONObj | None = None,
+    body: JSONLike | None = None,
 ) -> Request:
     """Construct one representative immutable request occurrence."""
 
     return Request(
         session_id=session_id,
-        source=source,
         kind=kind,
-        cache_mode=cache_mode,
+        method=method,
         params=params,
+        body=body,
     )
 
 
 def test_request_hash_determinism() -> None:
-    """Equivalent logical requests have the same deterministic hash."""
+    """Equivalent questions have the same deterministic identity."""
 
     params = {
         "symbol": "AAPL",
         "limit": 10,
     }
 
-    r1 = _request(
+    first = _request(
         session_id="s1",
         params=params,
     )
-    r2 = _request(
+
+    second = _request(
         session_id="s2",
         params=params,
     )
 
-    assert r1.id != r2.id
-    assert r1.hash == r2.hash
+    assert first.id != second.id
+    assert first.session_id != second.session_id
+    assert first.hash == second.hash
 
 
-def test_request_hash_changes_with_logical_request() -> None:
-    """Changing logical request content changes its hash."""
+@pytest.mark.parametrize(
+    "second",
+    [
+        _request(
+            session_id="s2",
+            kind="different-kind",
+        ),
+        _request(
+            session_id="s2",
+            method=RequestMethod.POST,
+        ),
+        _request(
+            session_id="s2",
+            params={
+                "x": 2,
+            },
+        ),
+        _request(
+            session_id="s2",
+            body={
+                "command": "different",
+            },
+        ),
+    ],
+)
+def test_request_hash_changes_with_question_content(
+    second: Request,
+) -> None:
+    """Every question-bearing field participates in request identity."""
 
-    r1 = _request(
-        params={
-            "x": 1,
-        }
-    )
-    r2 = _request(
-        params={
-            "x": 2,
-        }
-    )
-
-    assert r1.hash != r2.hash
-
-
-def test_request_hash_includes_source() -> None:
-    """The external source participates in logical request identity."""
-
-    r1 = _request(
-        source="source-a",
-        params={
-            "x": 1,
-        },
-    )
-    r2 = _request(
-        source="source-b",
-        params={
-            "x": 1,
-        },
-    )
-
-    assert r1.hash != r2.hash
-
-
-def test_request_hash_excludes_cache_policy() -> None:
-    """Cache policy changes execution semantics but not logical identity."""
-
-    r1 = _request(
-        cache_mode=CacheMode.DEFAULT,
+    first = _request(
+        session_id="s1",
+        kind="fetch",
+        method=RequestMethod.GET,
         params={
             "x": 1,
         },
+        body=None,
     )
-    r2 = _request(
-        cache_mode=CacheMode.BYPASS,
+
+    assert first.hash != second.hash
+
+
+def test_request_hash_excludes_occurrence_context() -> None:
+    """Session membership does not participate in question identity."""
+
+    first = _request(
+        session_id="session-a",
         params={
-            "x": 1,
+            "symbol": "ES",
         },
     )
 
-    assert r1.hash == r2.hash
+    second = _request(
+        session_id="session-b",
+        params={
+            "symbol": "ES",
+        },
+    )
+
+    assert first.session_id != second.session_id
+    assert first.hash == second.hash
 
 
 def test_request_is_immutable() -> None:
@@ -117,7 +130,50 @@ def test_request_is_immutable() -> None:
     request = _request()
 
     with pytest.raises(FrozenInstanceError):
-        request.source = "different-source"  # type: ignore[misc]
+        request.kind = "different-kind"  # type: ignore[misc]
+
+
+def test_acquired_resolution_records_request_and_response_identity() -> None:
+    """An acquired resolution records which observation satisfied the request."""
+
+    resolution = Resolution(
+        request_id="request-1",
+        response_id="response-1",
+        kind=ResolutionKind.ACQUIRED,
+    )
+
+    assert resolution.request_id == "request-1"
+    assert resolution.response_id == "response-1"
+    assert resolution.kind is ResolutionKind.ACQUIRED
+    assert resolution.resolved_at.tzinfo is not None
+    assert resolution.resolved_at.utcoffset() is not None
+
+
+def test_reused_resolution_can_reference_existing_response() -> None:
+    """A reused resolution may point to an observation acquired elsewhere."""
+
+    resolution = Resolution(
+        request_id="request-2",
+        response_id="response-1",
+        kind=ResolutionKind.REUSED,
+    )
+
+    assert resolution.request_id == "request-2"
+    assert resolution.response_id == "response-1"
+    assert resolution.kind is ResolutionKind.REUSED
+
+
+def test_resolution_is_immutable() -> None:
+    """A recorded request-resolution fact cannot be rewritten."""
+
+    resolution = Resolution(
+        request_id="request-1",
+        response_id="response-1",
+        kind=ResolutionKind.ACQUIRED,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        resolution.kind = ResolutionKind.REUSED  # type: ignore[misc]
 
 
 def test_response_from_bytes_derives_payload_identity() -> None:
@@ -237,6 +293,7 @@ def test_adapter_result_meta_dict_contains_generic_metadata() -> None:
 def test_session_end_sets_timestamp() -> None:
     session = Session(
         source="test",
+        cache_mode=CacheMode.DEFAULT,
         mode=SessionMode.SYNC,
     )
 
@@ -247,6 +304,12 @@ def test_session_end_sets_timestamp() -> None:
 
 
 def test_enum_roundtrip() -> None:
+    assert SessionMode("async") == SessionMode.ASYNC
+    assert RequestMethod("GET") == RequestMethod.GET
+    assert CacheMode("default") == CacheMode.DEFAULT
+    assert ResolutionKind("acquired") == ResolutionKind.ACQUIRED
+    assert ResolutionKind("reused") == ResolutionKind.REUSED
+    assert ResponseStatus("ok") == ResponseStatus.OK
     assert SessionMode("async") == SessionMode.ASYNC
     assert RequestMethod("GET") == RequestMethod.GET
     assert CacheMode("default") == CacheMode.DEFAULT

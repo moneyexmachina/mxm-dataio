@@ -2,11 +2,11 @@
 
 These tests exercise the real migrated PostgreSQL schema. They prove that the
 request SQL adapter matches that schema, that multiple request occurrences may
-share one logical request hash, that session/source relational integrity is
-enforced, and that request JSON and conflict semantics behave correctly through
-real PostgreSQL.
+share one question hash across different Sessions, that Session membership is
+relationally enforced, and that request JSON and conflict semantics behave
+correctly through real PostgreSQL.
 
-Detailed SQL construction, row validation, logical-identity computation, and
+Detailed SQL construction, row validation, question-identity computation, and
 transaction non-ownership are tested separately by the request unit tests.
 """
 
@@ -42,21 +42,30 @@ def _session(
     *,
     session_id: str,
     source: str = "test-source",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
+    mode: SessionMode = SessionMode.SYNC,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
     started_at: datetime | None = None,
 ) -> Session:
-    """Construct one deterministic parent DataIO session."""
+    """Construct one deterministic parent DataIO Session."""
 
     return Session(
         id=session_id,
         source=source,
-        mode=SessionMode.SYNC,
+        cache_mode=cache_mode,
+        mode=mode,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         started_at=(
             started_at
             if started_at is not None
             else datetime(
                 2026,
                 9,
-                2,
+                3,
                 10,
                 0,
                 tzinfo=UTC,
@@ -69,25 +78,18 @@ def _request(
     *,
     request_id: str,
     session_id: str,
-    source: str = "test-source",
     kind: str = "prices",
-    cache_mode: CacheMode = CacheMode.DEFAULT,
     method: RequestMethod = RequestMethod.GET,
     params: JSONObj | None = None,
     body: JSONLike | None = None,
     created_at: datetime | None = None,
-    ttl_seconds: float | None = 300.0,
-    as_of_bucket: str | None = None,
-    cache_tag: str | None = None,
 ) -> Request:
     """Construct one deterministic request occurrence."""
 
     return Request(
         id=request_id,
         session_id=session_id,
-        source=source,
         kind=kind,
-        cache_mode=cache_mode,
         method=method,
         params=params,
         body=body,
@@ -97,34 +99,35 @@ def _request(
             else datetime(
                 2026,
                 9,
-                2,
+                3,
                 10,
                 5,
                 tzinfo=UTC,
             )
         ),
-        ttl_seconds=ttl_seconds,
-        as_of_bucket=as_of_bucket,
-        cache_tag=cache_tag,
     )
 
 
 def test_requests_round_trip_through_postgres(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Complete request state round-trips through the migrated schema."""
+    """Complete Request state round-trips through the migrated schema."""
 
     database = migrated_postgres_database
 
     session = _session(
         session_id="session-round-trip",
+        source="example-source",
+        cache_mode=CacheMode.REVALIDATE,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03T10",
+        cache_tag="vendor-v1",
     )
 
     request = _request(
         request_id="request-round-trip",
         session_id=session.id,
         method=RequestMethod.POST,
-        cache_mode=CacheMode.REVALIDATE,
         params={
             "symbol": "ES",
             "fields": [
@@ -137,9 +140,6 @@ def test_requests_round_trip_through_postgres(
                 "adjusted": False,
             },
         },
-        ttl_seconds=600.0,
-        as_of_bucket="2026-09-02T10",
-        cache_tag="vendor-v1",
     )
 
     with database.transaction() as connection:
@@ -172,26 +172,38 @@ def test_requests_round_trip_through_postgres(
     assert missing_request is None
 
 
-def test_equivalent_logical_requests_persist_as_distinct_occurrences(
+def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Distinct Q occurrences sharing one H are independently persisted."""
+    """The same question may occur independently in different Session contexts."""
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-shared-hash",
+    first_session = _session(
+        session_id="session-question-a",
+        source="source-a",
+        cache_mode=CacheMode.DEFAULT,
+        ttl_seconds=300.0,
+        as_of_bucket="bucket-a",
+        cache_tag="vendor-v1",
+    )
+
+    second_session = _session(
+        session_id="session-question-b",
+        source="source-b",
+        cache_mode=CacheMode.BYPASS,
+        ttl_seconds=None,
+        as_of_bucket="bucket-b",
+        cache_tag="vendor-v2",
     )
 
     first = _request(
         request_id="request-1",
-        session_id=session.id,
-        cache_mode=CacheMode.DEFAULT,
-        ttl_seconds=300.0,
+        session_id=first_session.id,
         created_at=datetime(
             2026,
             9,
-            2,
+            3,
             10,
             5,
             tzinfo=UTC,
@@ -203,13 +215,11 @@ def test_equivalent_logical_requests_persist_as_distinct_occurrences(
 
     second = _request(
         request_id="request-2",
-        session_id=session.id,
-        cache_mode=CacheMode.BYPASS,
-        ttl_seconds=None,
+        session_id=second_session.id,
         created_at=datetime(
             2026,
             9,
-            2,
+            3,
             10,
             6,
             tzinfo=UTC,
@@ -220,13 +230,20 @@ def test_equivalent_logical_requests_persist_as_distinct_occurrences(
     )
 
     assert first.id != second.id
+    assert first.session_id != second.session_id
     assert first.hash == second.hash
 
     with database.transaction() as connection:
         insert_session(
             connection,
             schema=database.schema,
-            session=session,
+            session=first_session,
+        )
+
+        insert_session(
+            connection,
+            schema=database.schema,
+            session=second_session,
         )
 
         insert_request(
@@ -254,72 +271,37 @@ def test_equivalent_logical_requests_persist_as_distinct_occurrences(
     }
 
 
-def test_request_source_must_match_session_source(
+def test_request_requires_persisted_parent_session(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The real composite foreign key enforces session/request source identity."""
+    """The real foreign key requires every Request to belong to a Session."""
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-source-integrity",
-        source="source-a",
-    )
-
-    valid_request = _request(
-        request_id="request-valid-source",
-        session_id=session.id,
-        source="source-a",
+    request = _request(
+        request_id="request-missing-session",
+        session_id="session-not-persisted",
         params={
             "symbol": "ES",
         },
     )
-
-    invalid_request = _request(
-        request_id="request-invalid-source",
-        session_id=session.id,
-        source="source-b",
-        params={
-            "symbol": "ES",
-        },
-    )
-
-    with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
-        insert_request(
-            connection,
-            schema=database.schema,
-            request=valid_request,
-        )
 
     with pytest.raises(ForeignKeyViolation):
         with database.transaction() as connection:
             insert_request(
                 connection,
                 schema=database.schema,
-                request=invalid_request,
+                request=request,
             )
 
     with database.transaction() as connection:
-        persisted_valid = fetch_request_by_id(
+        persisted_request = fetch_request_by_id(
             connection,
             schema=database.schema,
-            request_id=valid_request.id,
+            request_id=request.id,
         )
 
-        persisted_invalid = fetch_request_by_id(
-            connection,
-            schema=database.schema,
-            request_id=invalid_request.id,
-        )
-
-    assert persisted_valid == valid_request
-    assert persisted_invalid is None
+    assert persisted_request is None
 
 
 def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
@@ -391,7 +373,7 @@ def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
 def test_request_json_round_trips_through_postgres(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Nested JSON values survive Psycopg/PostgreSQL JSONB round-tripping."""
+    """Nested question JSON survives Psycopg/PostgreSQL JSONB round-tripping."""
 
     database = migrated_postgres_database
 

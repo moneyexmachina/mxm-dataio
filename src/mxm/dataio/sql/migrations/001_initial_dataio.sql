@@ -1,7 +1,13 @@
 CREATE TABLE {schema}.sessions (
     id text PRIMARY KEY,
     source text NOT NULL,
+
     mode text NOT NULL,
+    cache_mode text NOT NULL,
+    ttl_seconds double precision,
+    as_of_bucket text,
+    cache_tag text,
+
     started_at timestamptz NOT NULL,
     ended_at timestamptz,
 
@@ -14,15 +20,18 @@ CREATE TABLE {schema}.sessions (
     CONSTRAINT sessions_mode_non_empty
         CHECK (mode <> ''),
 
-    CONSTRAINT sessions_id_source_unique
-        UNIQUE (id, source)
+    CONSTRAINT sessions_cache_mode_non_empty
+        CHECK (cache_mode <> ''),
+
+    CONSTRAINT sessions_ttl_seconds_non_negative
+        CHECK (
+            ttl_seconds IS NULL
+            OR ttl_seconds >= 0
+        )
 );
-
-
 CREATE TABLE {schema}.requests (
     id text PRIMARY KEY,
     session_id text NOT NULL,
-    source text NOT NULL,
 
     kind text NOT NULL,
     method text NOT NULL,
@@ -31,18 +40,10 @@ CREATE TABLE {schema}.requests (
 
     hash text NOT NULL,
 
-    cache_mode text NOT NULL,
-    ttl_seconds double precision,
-    as_of_bucket text,
-    cache_tag text,
-
     created_at timestamptz NOT NULL,
 
     CONSTRAINT requests_id_non_empty
         CHECK (id <> ''),
-
-    CONSTRAINT requests_source_non_empty
-        CHECK (source <> ''),
 
     CONSTRAINT requests_kind_non_empty
         CHECK (kind <> ''),
@@ -50,17 +51,8 @@ CREATE TABLE {schema}.requests (
     CONSTRAINT requests_method_non_empty
         CHECK (method <> ''),
 
-    CONSTRAINT requests_cache_mode_non_empty
-        CHECK (cache_mode <> ''),
-
     CONSTRAINT requests_hash_sha256
         CHECK (hash ~ '^[0-9a-f]{64}$'),
-
-    CONSTRAINT requests_ttl_seconds_non_negative
-        CHECK (
-            ttl_seconds IS NULL
-            OR ttl_seconds >= 0
-        ),
 
     CONSTRAINT requests_params_object
         CHECK (
@@ -68,11 +60,10 @@ CREATE TABLE {schema}.requests (
             OR jsonb_typeof(params) = 'object'
         ),
 
-    CONSTRAINT requests_session_source_fk
-        FOREIGN KEY (session_id, source)
-        REFERENCES {schema}.sessions (id, source)
+    CONSTRAINT requests_session_fk
+        FOREIGN KEY (session_id)
+        REFERENCES {schema}.sessions (id)
 );
-
 CREATE TABLE {schema}.responses (
     id text PRIMARY KEY,
     request_id text NOT NULL,

@@ -1,9 +1,10 @@
 """PostgreSQL integration tests for DataIO session SQL/schema compatibility.
 
 These tests exercise the real migrated PostgreSQL schema. They prove that the
-session SQL adapter matches that schema, that session round-tripping and latest
-session selection have the intended PostgreSQL semantics, and that session
-identity and completion behave as an append-oriented operational ledger.
+session SQL adapter matches that schema, that complete session handling context
+round-trips correctly, that latest-session selection has the intended
+PostgreSQL semantics, and that session identity and completion behave as an
+append-oriented operational ledger.
 
 Detailed SQL construction, row validation, and transaction non-ownership are
 tested separately by the session unit tests.
@@ -16,7 +17,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from mxm.dataio.models import Session, SessionMode
+from mxm.dataio.models import CacheMode, Session, SessionMode
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.sessions import (
     SessionConflictError,
@@ -33,7 +34,11 @@ def _session(
     *,
     session_id: str,
     source: str = "test-source",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     mode: SessionMode = SessionMode.SYNC,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
     started_at: datetime,
     ended_at: datetime | None = None,
 ) -> Session:
@@ -42,7 +47,11 @@ def _session(
     return Session(
         id=session_id,
         source=source,
+        cache_mode=cache_mode,
         mode=mode,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         started_at=started_at,
         ended_at=ended_at,
     )
@@ -51,18 +60,22 @@ def _session(
 def test_sessions_round_trip_through_postgres(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Session writes and reads match the real migrated schema."""
+    """Complete Session state survives the real migrated schema."""
 
     database = migrated_postgres_database
 
     session = _session(
         session_id="session-round-trip",
         source="example-source",
+        cache_mode=CacheMode.REVALIDATE,
         mode=SessionMode.BATCH,
+        ttl_seconds=600.0,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v2",
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             9,
             0,
             tzinfo=UTC,
@@ -106,7 +119,7 @@ def test_latest_session_selection_uses_postgres_ordering(
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             8,
             0,
             tzinfo=UTC,
@@ -119,7 +132,7 @@ def test_latest_session_selection_uses_postgres_ordering(
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             10,
             0,
             tzinfo=UTC,
@@ -132,7 +145,7 @@ def test_latest_session_selection_uses_postgres_ordering(
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             10,
             0,
             tzinfo=UTC,
@@ -145,7 +158,7 @@ def test_latest_session_selection_uses_postgres_ordering(
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             11,
             0,
             tzinfo=UTC,
@@ -191,21 +204,25 @@ def test_latest_session_selection_uses_postgres_ordering(
     assert missing_source is None
 
 
-def test_session_persistence_is_idempotent_and_rejects_identity_conflicts(
+def test_session_persistence_is_idempotent_and_rejects_context_conflicts(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Identical session state is idempotent while conflicting state is rejected."""
+    """Identical Session state is idempotent; handling context is immutable."""
 
     database = migrated_postgres_database
 
     session = _session(
         session_id="session-stable-identity",
         source="source-a",
+        cache_mode=CacheMode.DEFAULT,
         mode=SessionMode.SYNC,
+        ttl_seconds=300.0,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v1",
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             9,
             0,
             tzinfo=UTC,
@@ -229,7 +246,7 @@ def test_session_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     conflicting_session = replace(
         session,
-        source="source-b",
+        cache_mode=CacheMode.BYPASS,
     )
 
     with pytest.raises(
@@ -256,17 +273,21 @@ def test_session_persistence_is_idempotent_and_rejects_identity_conflicts(
 def test_session_completion_is_persisted_and_monotonic(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """A session completion can be recorded once but cannot be rewritten."""
+    """Completion mutates lifecycle state without changing handling context."""
 
     database = migrated_postgres_database
 
     session = _session(
         session_id="session-completion",
         source="source-a",
+        cache_mode=CacheMode.ONLY_IF_CACHED,
+        ttl_seconds=None,
+        as_of_bucket="2026-09-03",
+        cache_tag="vendor-v1",
         started_at=datetime(
             2026,
             9,
-            2,
+            3,
             9,
             0,
             tzinfo=UTC,
@@ -276,7 +297,7 @@ def test_session_completion_is_persisted_and_monotonic(
     ended_at = datetime(
         2026,
         9,
-        2,
+        3,
         9,
         30,
         tzinfo=UTC,
@@ -321,7 +342,7 @@ def test_session_completion_is_persisted_and_monotonic(
     different_end = datetime(
         2026,
         9,
-        2,
+        3,
         9,
         31,
         tzinfo=UTC,

@@ -5,14 +5,16 @@ PostgreSQL server provided by Testcontainers, using one isolated schema per
 test.
 
 They prove the DataIO interaction-ledger schema contract: expected tables and
-PostgreSQL representations, request-occurrence identity, important relational
-constraints and indexes, migration-ledger state, non-mutating inspection,
-idempotent replay, and isolation between test schemas.
+PostgreSQL representations, request-occurrence identity, Session/Request
+ownership, important relational constraints and indexes, migration-ledger
+state, non-mutating inspection, idempotent replay, and isolation between test
+schemas.
 
 They also prove several architectural invariants encoded by the schema:
 
-- logical request hash is not unique;
-- request source must agree with its session source;
+- Session owns source and DataIO handling/reuse context;
+- Request owns one question occurrence and references its Session by ID;
+- question hash is not unique across request occurrences or Sessions;
 - operational vocabularies are stored rather than authored by PostgreSQL;
 - resolution kind is part of the closed persistence ontology.
 
@@ -32,6 +34,7 @@ type ExecutableQuery = sql.SQL | sql.Composed
 
 pytestmark = pytest.mark.postgres
 
+
 _EXPECTED_TABLES = frozenset(
     {
         "schema_migrations",
@@ -41,6 +44,7 @@ _EXPECTED_TABLES = frozenset(
         "resolutions",
     }
 )
+
 
 _EXPECTED_INDEXES = frozenset(
     {
@@ -52,6 +56,11 @@ _EXPECTED_INDEXES = frozenset(
         "resolutions_response_id_idx",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL inspection helpers
+# ---------------------------------------------------------------------------
 
 
 def _fetch_rows(
@@ -92,6 +101,40 @@ def _table_names(
             """
         ),
         (schema,),
+    )
+
+    return {
+        row[0]
+        for row in rows
+        if isinstance(
+            row[0],
+            str,
+        )
+    }
+
+
+def _column_names(
+    database: PostgresDatabase,
+    *,
+    table: str,
+) -> set[str]:
+    """Return column names for one table in the migrated schema."""
+
+    rows = _fetch_rows(
+        database,
+        sql.SQL(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """
+        ),
+        (
+            database.schema,
+            table,
+        ),
     )
 
     return {
@@ -170,7 +213,10 @@ def _constraint_columns(
                 f"PostgreSQL returned an invalid constraint ordinality: {ordinality!r}"
             )
 
-        if not isinstance(column, str):
+        if not isinstance(
+            column,
+            str,
+        ):
             raise AssertionError(
                 f"PostgreSQL returned a non-text constraint column: {column!r}"
             )
@@ -255,15 +301,26 @@ def _foreign_keys(
             )
 
         if (
-            not isinstance(source_column, str)
-            or not isinstance(referenced_table, str)
-            or not isinstance(referenced_column, str)
+            not isinstance(
+                source_column,
+                str,
+            )
+            or not isinstance(
+                referenced_table,
+                str,
+            )
+            or not isinstance(
+                referenced_column,
+                str,
+            )
         ):
             raise AssertionError(
                 f"PostgreSQL returned an unexpected foreign-key row: {row!r}"
             )
 
-        existing = relationships.get(constraint_oid)
+        existing = relationships.get(
+            constraint_oid,
+        )
 
         if existing is None:
             relationships[constraint_oid] = (
@@ -280,8 +337,12 @@ def _foreign_keys(
                     "multiple tables."
                 )
 
-            source_columns.append(source_column)
-            referenced_columns.append(referenced_column)
+            source_columns.append(
+                source_column,
+            )
+            referenced_columns.append(
+                referenced_column,
+            )
 
     return {
         (
@@ -289,7 +350,11 @@ def _foreign_keys(
             referenced_table,
             tuple(referenced_columns),
         )
-        for source_columns, referenced_table, referenced_columns in relationships.values()
+        for (
+            source_columns,
+            referenced_table,
+            referenced_columns,
+        ) in relationships.values()
     }
 
 
@@ -334,20 +399,29 @@ def _constraint_names(
     }
 
 
+# ---------------------------------------------------------------------------
+# Schema shape
+# ---------------------------------------------------------------------------
+
+
 def test_packaged_migrations_create_expected_dataio_schema(
     postgres_database: PostgresDatabase,
 ) -> None:
     """Packaged migrations create the complete current DataIO schema."""
 
     database = postgres_database
-    runner = MigrationRunner(database)
+    runner = MigrationRunner(
+        database,
+    )
 
     assert database.schema.startswith("dataio_test_")
     assert database.schema != "dataio"
 
     applied_versions = runner.migrate()
 
-    assert applied_versions == ["001"]
+    assert applied_versions == [
+        "001",
+    ]
 
     assert (
         _table_names(
@@ -356,6 +430,35 @@ def test_packaged_migrations_create_expected_dataio_schema(
         )
         == _EXPECTED_TABLES
     )
+
+    assert _column_names(
+        database,
+        table="sessions",
+    ) == {
+        "id",
+        "source",
+        "mode",
+        "cache_mode",
+        "ttl_seconds",
+        "as_of_bucket",
+        "cache_tag",
+        "started_at",
+        "ended_at",
+    }
+
+    assert _column_names(
+        database,
+        table="requests",
+    ) == {
+        "id",
+        "session_id",
+        "kind",
+        "method",
+        "params",
+        "body",
+        "hash",
+        "created_at",
+    }
 
     jsonb_columns = _fetch_rows(
         database,
@@ -415,9 +518,24 @@ def test_packaged_migrations_create_expected_relational_constraints(
 
     database = postgres_database
 
-    MigrationRunner(database).migrate()
+    MigrationRunner(
+        database,
+    ).migrate()
 
-    assert ("id", "source") in _constraint_columns(
+    assert _constraint_columns(
+        database,
+        table="sessions",
+        constraint_type="p",
+    ) == {
+        ("id",),
+    }
+
+    # Session identity is its primary key. Source no longer participates in
+    # the Request relationship and therefore needs no composite uniqueness.
+    assert (
+        "id",
+        "source",
+    ) not in _constraint_columns(
         database,
         table="sessions",
         constraint_type="u",
@@ -428,15 +546,9 @@ def test_packaged_migrations_create_expected_relational_constraints(
         table="requests",
     ) == {
         (
-            (
-                "session_id",
-                "source",
-            ),
+            ("session_id",),
             "sessions",
-            (
-                "id",
-                "source",
-            ),
+            ("id",),
         ),
     }
 
@@ -475,8 +587,8 @@ def test_packaged_migrations_create_expected_relational_constraints(
         ("request_id",),
     }
 
-    # Logical request identity is deliberately not unique. Multiple request
-    # occurrences may carry the same hash.
+    # Question identity is deliberately not unique. Multiple request
+    # occurrences, including requests in different Sessions, may share H.
     assert ("hash",) not in _constraint_columns(
         database,
         table="requests",
@@ -514,41 +626,73 @@ def test_packaged_migrations_create_expected_relational_constraints(
     assert _EXPECTED_INDEXES <= actual_indexes
 
 
-def test_equivalent_logical_requests_can_be_distinct_occurrences(
+# ---------------------------------------------------------------------------
+# Request occurrence / question identity
+# ---------------------------------------------------------------------------
+
+
+def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Two request occurrences may persist the same logical request hash."""
+    """The same question hash may occur under different Session contexts."""
 
     database = migrated_postgres_database
 
     with database.transaction() as connection:
         with connection.cursor() as cursor:
+            session_insert = sql.SQL(
+                """
+                INSERT INTO {} (
+                    id,
+                    source,
+                    mode,
+                    cache_mode,
+                    ttl_seconds,
+                    as_of_bucket,
+                    cache_tag,
+                    started_at
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            ).format(
+                sql.Identifier(
+                    database.schema,
+                    "sessions",
+                )
+            )
+
             cursor.execute(
-                sql.SQL(
-                    """
-                    INSERT INTO {} (
-                        id,
-                        source,
-                        mode,
-                        started_at
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        CURRENT_TIMESTAMP
-                    )
-                    """
-                ).format(
-                    sql.Identifier(
-                        database.schema,
-                        "sessions",
-                    )
-                ),
+                session_insert,
                 (
                     "session-1",
-                    "example-source",
+                    "source-a",
                     "sync",
+                    "default",
+                    300.0,
+                    "bucket-a",
+                    "vendor-v1",
+                ),
+            )
+
+            cursor.execute(
+                session_insert,
+                (
+                    "session-2",
+                    "source-b",
+                    "batch",
+                    "bypass",
+                    None,
+                    "bucket-b",
+                    "vendor-v2",
                 ),
             )
 
@@ -557,18 +701,14 @@ def test_equivalent_logical_requests_can_be_distinct_occurrences(
                 INSERT INTO {} (
                     id,
                     session_id,
-                    source,
                     kind,
                     method,
                     params,
                     body,
                     hash,
-                    cache_mode,
                     created_at
                 )
                 VALUES (
-                    %s,
-                    %s,
                     %s,
                     %s,
                     %s,
@@ -586,20 +726,18 @@ def test_equivalent_logical_requests_can_be_distinct_occurrences(
                 )
             )
 
-            logical_hash = "a" * 64
+            question_hash = "a" * 64
 
             cursor.execute(
                 request_insert,
                 (
                     "request-1",
                     "session-1",
-                    "example-source",
                     "example",
                     "QUERY",
                     None,
                     None,
-                    logical_hash,
-                    "default",
+                    question_hash,
                 ),
             )
 
@@ -607,14 +745,12 @@ def test_equivalent_logical_requests_can_be_distinct_occurrences(
                 request_insert,
                 (
                     "request-2",
-                    "session-1",
-                    "example-source",
+                    "session-2",
                     "example",
                     "QUERY",
                     None,
                     None,
-                    logical_hash,
-                    "default",
+                    question_hash,
                 ),
             )
 
@@ -624,6 +760,7 @@ def test_equivalent_logical_requests_can_be_distinct_occurrences(
             """
             SELECT
                 id,
+                session_id,
                 hash
             FROM {}
             ORDER BY id
@@ -639,54 +776,27 @@ def test_equivalent_logical_requests_can_be_distinct_occurrences(
     assert rows == [
         (
             "request-1",
+            "session-1",
             "a" * 64,
         ),
         (
             "request-2",
+            "session-2",
             "a" * 64,
         ),
     ]
 
 
-def test_request_source_must_match_session_source(
+def test_request_must_reference_existing_session(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The composite foreign key prevents cross-source request occurrences."""
+    """Every request occurrence must belong to one persisted Session."""
 
     database = migrated_postgres_database
 
-    with database.transaction() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                sql.SQL(
-                    """
-                    INSERT INTO {} (
-                        id,
-                        source,
-                        mode,
-                        started_at
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        CURRENT_TIMESTAMP
-                    )
-                    """
-                ).format(
-                    sql.Identifier(
-                        database.schema,
-                        "sessions",
-                    )
-                ),
-                (
-                    "session-1",
-                    "source-a",
-                    "sync",
-                ),
-            )
-
-    with pytest.raises(errors.ForeignKeyViolation):
+    with pytest.raises(
+        errors.ForeignKeyViolation,
+    ):
         with database.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -695,16 +805,12 @@ def test_request_source_must_match_session_source(
                         INSERT INTO {} (
                             id,
                             session_id,
-                            source,
                             kind,
                             method,
                             hash,
-                            cache_mode,
                             created_at
                         )
                         VALUES (
-                            %s,
-                            %s,
                             %s,
                             %s,
                             %s,
@@ -721,14 +827,17 @@ def test_request_source_must_match_session_source(
                     ),
                     (
                         "request-1",
-                        "session-1",
-                        "source-b",
+                        "missing-session",
                         "example",
                         "QUERY",
                         "a" * 64,
-                        "default",
                     ),
                 )
+
+
+# ---------------------------------------------------------------------------
+# Persistence vocabulary
+# ---------------------------------------------------------------------------
 
 
 def test_operational_vocabularies_are_not_authored_by_sql(
@@ -747,9 +856,11 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                         id,
                         source,
                         mode,
+                        cache_mode,
                         started_at
                     )
                     VALUES (
+                        %s,
                         %s,
                         %s,
                         %s,
@@ -766,6 +877,7 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                     "session-open-vocabulary",
                     "source-open-vocabulary",
                     "future-session-mode",
+                    "future-cache-policy",
                 ),
             )
 
@@ -775,16 +887,12 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                     INSERT INTO {} (
                         id,
                         session_id,
-                        source,
                         kind,
                         method,
                         hash,
-                        cache_mode,
                         created_at
                     )
                     VALUES (
-                        %s,
-                        %s,
                         %s,
                         %s,
                         %s,
@@ -802,11 +910,9 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                 (
                     "request-open-vocabulary",
                     "session-open-vocabulary",
-                    "source-open-vocabulary",
                     "future-kind",
                     "FUTURE_METHOD",
                     "b" * 64,
-                    "future-cache-policy",
                 ),
             )
 
@@ -864,12 +970,14 @@ def test_resolution_kind_is_closed_persistence_ontology(
                         id,
                         source,
                         mode,
+                        cache_mode,
                         started_at
                     )
                     VALUES (
                         'session-1',
                         'example-source',
                         'sync',
+                        'default',
                         CURRENT_TIMESTAMP
                     )
                     """
@@ -887,21 +995,17 @@ def test_resolution_kind_is_closed_persistence_ontology(
                     INSERT INTO {} (
                         id,
                         session_id,
-                        source,
                         kind,
                         method,
                         hash,
-                        cache_mode,
                         created_at
                     )
                     VALUES (
                         'request-1',
                         'session-1',
-                        'example-source',
                         'example',
                         'QUERY',
                         %s,
-                        'default',
                         CURRENT_TIMESTAMP
                     )
                     """
@@ -945,7 +1049,9 @@ def test_resolution_kind_is_closed_persistence_ontology(
                 ("e" * 64,),
             )
 
-    with pytest.raises(errors.CheckViolation):
+    with pytest.raises(
+        errors.CheckViolation,
+    ):
         with database.transaction() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -973,13 +1079,20 @@ def test_resolution_kind_is_closed_persistence_ontology(
                 )
 
 
+# ---------------------------------------------------------------------------
+# Migration lifecycle
+# ---------------------------------------------------------------------------
+
+
 def test_migration_state_is_versioned_current_and_idempotent(
     postgres_database: PostgresDatabase,
 ) -> None:
     """Migration ledger, inspection, replay, and schema isolation are correct."""
 
     database = postgres_database
-    runner = MigrationRunner(database)
+    runner = MigrationRunner(
+        database,
+    )
 
     discovered = {migration.version: migration for migration in runner.discover()}
 
@@ -992,7 +1105,9 @@ def test_migration_state_is_versioned_current_and_idempotent(
 
     first_applied_versions = runner.migrate()
 
-    assert first_applied_versions == ["001"]
+    assert first_applied_versions == [
+        "001",
+    ]
 
     ledger_rows = _fetch_rows(
         database,

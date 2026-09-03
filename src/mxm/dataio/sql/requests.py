@@ -2,12 +2,17 @@
 
 This module owns the PostgreSQL representation of ``Request`` objects.
 
-A Request is one occurrence of a logical external request. ``Request.id``
-identifies that occurrence, while ``Request.hash`` identifies what was asked
-of which external source.
+A Request is one immutable occurrence of an external question made within a
+DataIO Session.
 
-Multiple request occurrences may therefore legitimately share one logical
-request hash.
+``Request.id`` identifies the individual occurrence.
+
+``Request.hash`` identifies the question itself: kind, method, params, and
+body. It deliberately excludes Session-owned context such as source, cache
+policy, TTL, as-of bucket, and cache tag.
+
+Multiple request occurrences, including occurrences belonging to different
+sessions, may therefore legitimately share one question hash.
 
 All functions operate on a caller-provided Psycopg connection. They do not
 open, commit, or roll back transactions. Transaction ownership belongs to the
@@ -25,11 +30,7 @@ from typing import cast
 from psycopg import Connection, sql
 from psycopg.types.json import Jsonb
 
-from mxm.dataio.models import (
-    CacheMode,
-    Request,
-    RequestMethod,
-)
+from mxm.dataio.models import Request, RequestMethod
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.types import JSONLike, JSONObj
 
@@ -61,19 +62,7 @@ def fetch_request_by_id(
     schema: str,
     request_id: str,
 ) -> Request | None:
-    """Return one persisted request occurrence by ID, if present.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``requests`` table.
-        request_id:
-            Request-occurrence identifier to retrieve.
-
-    Returns:
-        The persisted request occurrence, or ``None`` when absent.
-    """
+    """Return one persisted request occurrence by ID, if present."""
 
     _validate_identifier(
         request_id,
@@ -85,16 +74,11 @@ def fetch_request_by_id(
         SELECT
             id,
             session_id,
-            source,
             kind,
             method,
             params,
             body,
             hash,
-            cache_mode,
-            ttl_seconds,
-            as_of_bucket,
-            cache_tag,
             created_at
         FROM {}
         WHERE id = %s
@@ -130,26 +114,15 @@ def fetch_requests_by_hash(
     schema: str,
     request_hash: str,
 ) -> dict[str, Request]:
-    """Return request occurrences sharing one logical request hash.
+    """Return request occurrences sharing one question hash.
 
     The returned mapping is keyed by request-occurrence ID.
 
-    Multiple returned requests are expected and legitimate: the hash
-    identifies the logical request, not the individual occurrence.
+    The hash identifies the question only. It does not establish reuse
+    eligibility: Session-owned source and resolution context must also be
+    considered by the higher-level resolution logic.
 
-    Results are deterministically ordered by creation time and then request
-    ID before being reconstructed into the mapping.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``requests`` table.
-        request_hash:
-            Logical request identity to retrieve.
-
-    Returns:
-        Matching request occurrences keyed by request ID.
+    Results are deterministically ordered by creation time and request ID.
     """
 
     _validate_hash(request_hash)
@@ -159,16 +132,11 @@ def fetch_requests_by_hash(
         SELECT
             id,
             session_id,
-            source,
             kind,
             method,
             params,
             body,
             hash,
-            cache_mode,
-            ttl_seconds,
-            as_of_bucket,
-            cache_tag,
             created_at
         FROM {}
         WHERE hash = %s
@@ -203,7 +171,7 @@ def insert_request(
     schema: str,
     request: Request,
 ) -> None:
-    """Persist one request occurrence idempotently.
+    """Persist one immutable request occurrence idempotently.
 
     A request occurrence absent from the database is inserted.
 
@@ -213,22 +181,8 @@ def insert_request(
     A request already present with the same occurrence ID but different state
     raises ``RequestConflictError``.
 
-    A different request occurrence with the same logical request hash is
-    legitimate and is persisted independently.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``requests`` table.
-        request:
-            Request occurrence to persist.
-
-    Raises:
-        RequestConflictError:
-            If the request occurrence ID already identifies different state.
-        RequestPersistenceError:
-            If the requested occurrence is invalid or absent after insertion.
+    A different request occurrence with the same question hash is legitimate
+    and is persisted independently.
     """
 
     _validate_request(request)
@@ -238,24 +192,14 @@ def insert_request(
         INSERT INTO {} (
             id,
             session_id,
-            source,
             kind,
             method,
             params,
             body,
             hash,
-            cache_mode,
-            ttl_seconds,
-            as_of_bucket,
-            cache_tag,
             created_at
         )
         VALUES (
-            %s,
-            %s,
-            %s,
-            %s,
-            %s,
             %s,
             %s,
             %s,
@@ -284,16 +228,11 @@ def insert_request(
             (
                 request.id,
                 request.session_id,
-                request.source,
                 request.kind,
                 request.method.value,
                 params_value,
                 body_value,
                 request.hash,
-                request.cache_mode.value,
-                request.ttl_seconds,
-                request.as_of_bucket,
-                request.cache_tag,
                 request.created_at,
             ),
         )
@@ -372,7 +311,7 @@ def _request_from_row(
 ) -> Request:
     """Reconstruct one validated request occurrence from a database row."""
 
-    if len(row) != 13:
+    if len(row) != 8:
         raise RequestPersistenceError(
             f"Request query returned an unexpected row shape: {row!r}"
         )
@@ -387,96 +326,65 @@ def _request_from_row(
         field="session_id",
     )
 
-    source = _require_text(
-        row[2],
-        field="source",
-    )
-
     kind = _require_text(
-        row[3],
+        row[2],
         field="kind",
     )
 
     method_text = _require_text(
-        row[4],
+        row[3],
         field="method",
     )
 
     params = _optional_json_object(
-        row[5],
+        row[4],
         field="params",
     )
 
     body = _optional_json_like(
-        row[6],
+        row[5],
         field="body",
     )
 
-    persisted_hash = _require_hash(row[7])
-
-    cache_mode_text = _require_text(
-        row[8],
-        field="cache_mode",
-    )
-
-    ttl_seconds = _optional_non_negative_number(
-        row[9],
-        field="ttl_seconds",
-    )
-
-    as_of_bucket = _optional_text(
-        row[10],
-        field="as_of_bucket",
-    )
-
-    cache_tag = _optional_text(
-        row[11],
-        field="cache_tag",
+    persisted_hash = _require_hash(
+        row[6],
     )
 
     created_at = _require_datetime(
-        row[12],
+        row[7],
         field="created_at",
     )
 
     try:
-        method = RequestMethod(method_text)
+        method = RequestMethod(
+            method_text,
+        )
     except ValueError as err:
         raise RequestPersistenceError(
             f"Persisted request method is not recognised: {method_text!r}"
         ) from err
 
-    try:
-        cache_mode = CacheMode(cache_mode_text)
-    except ValueError as err:
-        raise RequestPersistenceError(
-            f"Persisted request cache_mode is not recognised: {cache_mode_text!r}"
-        ) from err
-
     request = Request(
         id=request_id,
         session_id=session_id,
-        source=source,
         kind=kind,
         method=method,
         params=params,
         body=body,
-        cache_mode=cache_mode,
-        ttl_seconds=ttl_seconds,
-        as_of_bucket=as_of_bucket,
-        cache_tag=cache_tag,
         created_at=created_at,
     )
 
     if request.hash != persisted_hash:
         raise RequestPersistenceError(
-            "Persisted request hash is inconsistent with logical request "
-            f"identity: request_id={request.id!r}, "
+            "Persisted request hash is inconsistent with question identity: "
+            f"request_id={request.id!r}, "
             f"persisted_hash={persisted_hash!r}, "
             f"computed_hash={request.hash!r}"
         )
 
-    _validate_request(request)
+    _validate_request(
+        request,
+    )
 
     return request
 
@@ -502,11 +410,6 @@ def _validate_request(
     )
 
     _validate_identifier(
-        request.source,
-        field="source",
-    )
-
-    _validate_identifier(
         request.kind,
         field="kind",
     )
@@ -523,27 +426,25 @@ def _validate_request(
             field="body",
         )
 
-    if request.ttl_seconds is not None:
-        _validate_non_negative_number(
-            request.ttl_seconds,
-            field="ttl_seconds",
-        )
-
     _validate_datetime(
         request.created_at,
         field="created_at",
     )
 
-    _validate_hash(request.hash)
+    _validate_hash(
+        request.hash,
+    )
 
-    # ``hash`` is mutable dataclass state even though it is generated during
-    # construction. Reconstructing the dataclass gives us the canonical hash
-    # without duplicating logical-identity computation in the SQL layer.
-    canonical_request = replace(request)
+    # Request is frozen, but its JSON constituents may reference mutable
+    # containers. Reconstructing the dataclass recomputes the canonical
+    # question hash and detects any nested mutation before persistence.
+    canonical_request = replace(
+        request,
+    )
 
     if request.hash != canonical_request.hash:
         raise RequestPersistenceError(
-            "Request hash is inconsistent with logical request identity: "
+            "Request hash is inconsistent with question identity: "
             f"request_id={request.id!r}, "
             f"stored_hash={request.hash!r}, "
             f"computed_hash={canonical_request.hash!r}"
@@ -572,7 +473,7 @@ def _validate_identifier(
 def _validate_hash(
     value: object,
 ) -> None:
-    """Require a lowercase hexadecimal SHA-256 logical-request hash."""
+    """Require a lowercase hexadecimal SHA-256 question hash."""
 
     if (
         not isinstance(
@@ -590,9 +491,11 @@ def _validate_hash(
 def _require_hash(
     value: object,
 ) -> str:
-    """Require and return a persisted logical-request hash."""
+    """Require and return a persisted question hash."""
 
-    _validate_hash(value)
+    _validate_hash(
+        value,
+    )
 
     return cast(
         str,
@@ -616,27 +519,6 @@ def _require_text(
     ):
         raise RequestPersistenceError(
             f"Persisted request {field} must be non-empty text, got {value!r}"
-        )
-
-    return value
-
-
-def _optional_text(
-    value: object,
-    *,
-    field: str,
-) -> str | None:
-    """Require a persisted text or NULL value."""
-
-    if value is None:
-        return None
-
-    if not isinstance(
-        value,
-        str,
-    ):
-        raise RequestPersistenceError(
-            f"Persisted request {field} must be text or NULL, got {value!r}"
         )
 
     return value
@@ -686,48 +568,6 @@ def _require_datetime(
         )
 
     return value
-
-
-def _validate_non_negative_number(
-    value: object,
-    *,
-    field: str,
-) -> float:
-    """Require a non-negative numeric value."""
-
-    if isinstance(
-        value,
-        bool,
-    ) or not isinstance(
-        value,
-        int | float,
-    ):
-        raise RequestPersistenceError(f"Request {field} must be numeric, got {value!r}")
-
-    result = float(value)
-
-    if result < 0:
-        raise RequestPersistenceError(
-            f"Request {field} must be non-negative, got {value!r}"
-        )
-
-    return result
-
-
-def _optional_non_negative_number(
-    value: object,
-    *,
-    field: str,
-) -> float | None:
-    """Require a non-negative persisted numeric value or NULL."""
-
-    if value is None:
-        return None
-
-    return _validate_non_negative_number(
-        value,
-        field=field,
-    )
 
 
 # ---------------------------------------------------------------------
@@ -836,6 +676,7 @@ def _validate_json_like(
             list[object],
             value,
         )
+
         for index, item in enumerate(raw_items):
             _validate_json_like(
                 item,
