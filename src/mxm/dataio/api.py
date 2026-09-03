@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from enum import Enum
 from pathlib import Path
 from types import TracebackType
 
@@ -33,6 +32,7 @@ from mxm.dataio.adapters import Fetcher, Sender
 from mxm.dataio.cache import CacheStore
 from mxm.dataio.models import (
     AdapterResult,
+    CacheMode,
     Request,
     RequestMethod,
     Response,
@@ -43,21 +43,6 @@ from mxm.dataio.models import (
 from mxm.dataio.registry import resolve_adapter
 from mxm.dataio.store import Store
 from mxm.types import JSONLike, JSONObj
-
-# --------------------------------------------------------------------------- #
-# Cache mode enumeration
-# --------------------------------------------------------------------------- #
-
-
-class CacheMode(str, Enum):
-    """Policy controlling cache usage and persistence."""
-
-    DEFAULT = "default"  # Use cache if valid, else fetch
-    ONLY_IF_CACHED = "only_if_cached"  # Never hit network
-    BYPASS = "bypass"  # Always hit network, persist new
-    REVALIDATE = "revalidate"  # Use ETag/If-Modified-Since when supported
-    NEVER = "never"  # Do not use or store cache (ephemeral)
-
 
 # --------------------------------------------------------------------------- #
 # DataIoSession

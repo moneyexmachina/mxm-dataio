@@ -28,11 +28,11 @@ policy logic lives in the runtime API layer.
 import hashlib
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 
-from mxm.types import HeadersLike, JSONLike, JSONMap, JSONObj
+from mxm.types import JSONLike, JSONMap, JSONObj
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -77,6 +77,16 @@ class RequestMethod(str, Enum):
     COMMAND = "COMMAND"
 
 
+class CacheMode(str, Enum):
+    """Policy under which one request occurrence uses cached observations."""
+
+    DEFAULT = "default"
+    ONLY_IF_CACHED = "only_if_cached"
+    BYPASS = "bypass"
+    REVALIDATE = "revalidate"
+    NEVER = "never"
+
+
 class ResponseStatus(str, Enum):
     """Canonical response status values."""
 
@@ -101,7 +111,6 @@ class Session:
 
     source: str
     mode: SessionMode = SessionMode.SYNC
-    as_of: datetime = field(default_factory=_utcnow)
     id: str = field(default_factory=_uuid)
     started_at: datetime = field(default_factory=_utcnow)
     ended_at: datetime | None = None
@@ -111,88 +120,79 @@ class Session:
         self.ended_at = _utcnow()
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Request:
-    """Represents a single external I/O request.
-
-    Requests may represent read operations (e.g., data downloads),
-    write operations (e.g., order placement), or control messages
-    (e.g., subscribe/unsubscribe).  They are hashable and fully
-    deterministic given identical parameters.
-
-    Caching metadata
-    ----------------
-    The optional fields `cache_mode`, `ttl_seconds`, and `as_of_bucket`
-    record the policy context under which the request was executed.
-    They are also incorporated into the deterministic request hash,
-    ensuring that time-bucketed or TTL-sensitive requests produce
-    distinct fingerprints.
-    """
+    """One immutable occurrence of an external I/O request."""
 
     session_id: str
+    source: str
     kind: str
+    cache_mode: CacheMode
+
     method: RequestMethod = RequestMethod.GET
     params: JSONObj | None = None
     body: JSONLike | None = None
     id: str = field(default_factory=_uuid)
     created_at: datetime = field(default_factory=_utcnow)
-    cache_mode: str | None = None
     ttl_seconds: float | None = None
     as_of_bucket: str | None = None
     cache_tag: str | None = None
     hash: str = field(init=False)
 
     def __post_init__(self) -> None:
-        """Compute a deterministic hash for the request."""
+        """Compute the deterministic logical-request identity."""
+
         base: JSONLike = {
+            "source": self.source,
+            "kind": self.kind,
+            "method": self.method.value,
             "params": self.params,
             "body": self.body,
             "as_of_bucket": self.as_of_bucket,
             "cache_tag": self.cache_tag,
         }
-        serialized = _json_dumps(base)
-        self.hash = hashlib.sha256(
-            f"{self.kind}:{self.method}:{serialized}".encode()
-        ).hexdigest()
 
-    def to_json(self) -> str:
-        """Return a JSON string representation of this request."""
-        return _json_dumps(asdict(self))
+        object.__setattr__(
+            self,
+            "hash",
+            hashlib.sha256(_json_dumps(base).encode()).hexdigest(),
+        )
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Response:
-    """Represents the outcome of a single request.
+    """One immutable external response observation.
 
-    Responses may be one-off (for synchronous calls) or sequential
-    (for streaming or asynchronous interactions).  Each response stores
-    a checksum for integrity verification and can reference a file path
-    to the persisted payload.
+    ``id`` identifies this external observation.
 
-    Provenance and caching
-    ----------------------
-    Each response records its `fetched_at` timestamp and inherits the
-    caching context (`cache_mode`, `ttl_seconds`, `as_of_bucket`) from
-    the originating request.  These values enable reproducible
-    re-validation and cache-audit workflows, but do not affect checksum
-    computation or integrity verification.
+    ``request_id`` identifies the request occurrence that actually contacted
+    the external source and produced this observation.
+
+    ``payload_checksum`` identifies the exact payload bytes presented by the
+    external source at the adapter boundary. Distinct observations may
+    legitimately reference identical payload bytes and therefore share one
+    payload checksum.
+
+    Optional metadata describes generic properties of the payload or
+    acquisition. Source- or transport-specific metadata belongs in
+    ``adapter_meta``.
     """
 
     request_id: str
-    status: ResponseStatus = ResponseStatus.OK
-    checksum: str | None = None
-    path: str | None = None
-    created_at: datetime = field(default_factory=_utcnow)
+    status: ResponseStatus
+    payload_checksum: str
+    size_bytes: int
+
     id: str = field(default_factory=_uuid)
     sequence: int | None = None
-    size_bytes: int | None = None
 
-    # Provenance / caching metadata (taken from Request)
+    created_at: datetime = field(default_factory=_utcnow)
     fetched_at: datetime = field(default_factory=_utcnow)
-    cache_mode: str | None = None
-    ttl_seconds: float | None = None
-    as_of_bucket: str | None = None
-    cache_tag: str | None = None
+
+    media_type: str | None = None
+    encoding: str | None = None
+    elapsed_ms: int | None = None
+    adapter_meta: JSONObj | None = None
 
     @classmethod
     def from_bytes(
@@ -200,18 +200,16 @@ class Response:
         request_id: str,
         status: ResponseStatus,
         data: bytes,
-        path: str,
         sequence: int | None = None,
     ) -> "Response":
-        """Create a Response object from raw bytes."""
-        checksum = hashlib.sha256(data).hexdigest()
+        """Create an observation from exact external payload bytes."""
+
         return cls(
             request_id=request_id,
             status=status,
-            checksum=checksum,
-            path=path,
-            sequence=sequence,
+            payload_checksum=hashlib.sha256(data).hexdigest(),
             size_bytes=len(data),
+            sequence=sequence,
         )
 
     @classmethod
@@ -220,95 +218,76 @@ class Response:
         request_id: str,
         status: ResponseStatus,
         result: "AdapterResult",
-        path: str,
         sequence: int | None = None,
     ) -> "Response":
-        """Create a Response from an AdapterResult (checksum/size derived
-        from bytes)."""
-        return cls.from_bytes(
+        """Create an observation from an adapter result.
+
+        The payload checksum and size are derived from the exact bytes at the
+        adapter boundary. Generic acquisition metadata is copied onto the
+        observation; source-specific metadata remains opaque to DataIO.
+        """
+
+        return cls(
             request_id=request_id,
             status=status,
-            data=result.data,
-            path=path,
+            payload_checksum=hashlib.sha256(result.data).hexdigest(),
+            size_bytes=len(result.data),
             sequence=sequence,
+            media_type=result.media_type,
+            encoding=result.encoding,
+            elapsed_ms=result.elapsed_ms,
+            adapter_meta=(
+                dict(result.adapter_meta) if result.adapter_meta is not None else None
+            ),
         )
 
-    def verify(self, data: bytes) -> bool:
-        """Return True if the given data matches the stored checksum."""
-        if self.checksum is None:
-            return False
-        return hashlib.sha256(data).hexdigest() == self.checksum
+    def verify_payload(self, data: bytes) -> bool:
+        """Return whether bytes match this observation's payload identity."""
+
+        return hashlib.sha256(data).hexdigest() == self.payload_checksum
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class AdapterResult:
-    """Unified return envelope for adapters.
+    """Exact external payload plus generic acquisition metadata.
 
-    Adapters may return either:
-      • raw bytes (status quo), or
-      • an AdapterResult carrying bytes + transport metadata.
+    ``data`` contains the exact payload bytes presented by the external source
+    at the adapter boundary. DataIO does not semantically transform these
+    bytes before deriving payload identity or persisting them.
 
-    The `data` field contains the exact payload to persist under checksum.
-    All other fields are optional metadata that can be stored as a sidecar
-    JSON alongside the payload for inspection/replay.
+    Generic metadata may describe the representation or acquisition where
+    applicable. Transport-, protocol-, device-, or source-specific facts
+    belong in ``adapter_meta``.
 
-    Fields
-    ------
-    data:
-        Raw payload bytes from the external system (exact as received).
-    content_type:
-        MIME type if known (e.g., "application/json", "text/csv").
-    encoding:
-        Text encoding if applicable (e.g., "utf-8").
-    transport_status:
-        Transport-layer status code (e.g., HTTP status).
-    url:
-        Final request URL after redirects, if relevant.
-    elapsed_ms:
-        End-to-end elapsed time in milliseconds.
-    headers:
-        Flattened response headers (string-valued).
-    adapter_meta:
-        Free-form, source-specific metadata (rate limits, request id, etc.).
+    Examples of adapter-specific metadata include HTTP status and headers,
+    filesystem path and inode, broker request IDs, Kafka offsets, or device
+    identifiers. DataIO assigns no semantics to those values.
     """
 
     data: bytes
-    content_type: str | None = None
+
+    media_type: str | None = None
     encoding: str | None = None
-    transport_status: int | None = None
-    url: str | None = None
     elapsed_ms: int | None = None
-    headers: HeadersLike | None = None
     adapter_meta: JSONObj | None = None
 
     def meta_dict(self) -> JSONMap:
-        """Return a JSON-serializable dict of all non-payload metadata."""
+        """Return generic metadata as JSON for legacy persistence callers.
+
+        This compatibility helper may be removed when the legacy filesystem
+        sidecar persistence path is retired.
+        """
 
         result: JSONMap = {}
 
-        if self.content_type is not None:
-            result["content_type"] = self.content_type
+        if self.media_type is not None:
+            result["media_type"] = self.media_type
 
         if self.encoding is not None:
             result["encoding"] = self.encoding
 
-        if self.transport_status is not None:
-            result["transport_status"] = self.transport_status
-
-        if self.url is not None:
-            result["url"] = self.url
-
         if self.elapsed_ms is not None:
             result["elapsed_ms"] = self.elapsed_ms
-
-        if self.headers is not None:
-            headers_map: JSONMap = {}
-            for key, value in self.headers.items():
-                if isinstance(value, str):
-                    headers_map[key] = value
-                else:
-                    headers_map[key] = list(value)
-            result["headers"] = headers_map
 
         if self.adapter_meta is not None:
             result["adapter_meta"] = dict(self.adapter_meta)
