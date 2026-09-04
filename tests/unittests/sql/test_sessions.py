@@ -1,15 +1,15 @@
-"""Unit tests for plain-SQL DataIO session persistence operations."""
+"""Unit tests for plain-SQL DataIO Session persistence operations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal, Self, cast
 
 import pytest
 from psycopg import Connection, sql
 
-from mxm.dataio.models import CacheMode, Session, SessionMode
+from mxm.dataio.models import CacheMode, Session
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.sessions import (
     SessionConflictError,
@@ -18,6 +18,12 @@ from mxm.dataio.sql.sessions import (
     fetch_session_by_id,
     insert_session,
     mark_session_ended,
+)
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_int,
+    ts_ns_from_str,
+    ts_ns_to_int,
 )
 
 type ExecutableQuery = sql.SQL | sql.Composed
@@ -68,6 +74,7 @@ class FakeCursor:
         exc_value: object,
         traceback: object,
     ) -> None:
+        _ = exc_type, exc_value, traceback
         """Exit the fake cursor context."""
 
     def execute(
@@ -143,12 +150,33 @@ def _as_connection(
 
 
 # ---------------------------------------------------------------------------
-# Session fixtures
+# Timestamp fixtures and boundary helpers
 # ---------------------------------------------------------------------------
 
 
-_STARTED_AT = datetime(2026, 9, 3, 9, 0, tzinfo=UTC)
-_ENDED_AT = datetime(2026, 9, 3, 9, 30, tzinfo=UTC)
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+_STARTED_AT = ts_ns_from_str("2026-09-03T09:00:00.000000000Z")
+_ENDED_AT = ts_ns_from_str("2026-09-03T09:30:00.000000000Z")
+
+
+def _db_datetime(
+    value: TSNSScalar,
+) -> datetime:
+    """Encode a microsecond-aligned MXM timestamp as a fake Psycopg value."""
+
+    nanoseconds = ts_ns_to_int(value)
+
+    assert nanoseconds % 1_000 == 0
+
+    return _UNIX_EPOCH + timedelta(
+        microseconds=nanoseconds // 1_000,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Session fixtures
+# ---------------------------------------------------------------------------
 
 
 def _session(
@@ -156,20 +184,18 @@ def _session(
     session_id: str = "session-1",
     source: str = "example-source",
     cache_mode: CacheMode = CacheMode.DEFAULT,
-    mode: SessionMode = SessionMode.SYNC,
     ttl_seconds: float | None = 300.0,
     as_of_bucket: str | None = None,
     cache_tag: str | None = None,
-    started_at: datetime = _STARTED_AT,
-    ended_at: datetime | None = None,
+    started_at: TSNSScalar = _STARTED_AT,
+    ended_at: TSNSScalar | None = None,
 ) -> Session:
-    """Construct one representative DataIO session."""
+    """Construct one representative DataIO Session."""
 
     return Session(
         id=session_id,
         source=source,
         cache_mode=cache_mode,
-        mode=mode,
         ttl_seconds=ttl_seconds,
         as_of_bucket=as_of_bucket,
         cache_tag=cache_tag,
@@ -181,18 +207,17 @@ def _session(
 def _session_row(
     session: Session,
 ) -> PostgresRow:
-    """Encode one Session as a PostgreSQL result row."""
+    """Encode one Session as a fake Psycopg PostgreSQL result row."""
 
     return (
         session.id,
         session.source,
-        session.mode.value,
         session.cache_mode.value,
         session.ttl_seconds,
         session.as_of_bucket,
         session.cache_tag,
-        session.started_at,
-        session.ended_at,
+        _db_datetime(session.started_at),
+        (_db_datetime(session.ended_at) if session.ended_at is not None else None),
     )
 
 
@@ -253,7 +278,7 @@ def _single_execution(
 
 
 def test_fetch_session_by_id_returns_none_when_absent() -> None:
-    """A missing session ID returns no persisted session."""
+    """A missing Session ID returns no persisted Session."""
 
     connection = FakeConnection(
         [
@@ -272,11 +297,10 @@ def test_fetch_session_by_id_returns_none_when_absent() -> None:
 
 
 def test_fetch_session_by_id_reconstructs_complete_session() -> None:
-    """A persisted row reconstructs lifecycle and handling context."""
+    """A persisted row reconstructs lifecycle and cache context."""
 
     expected = _session(
-        cache_mode=CacheMode.REVALIDATE,
-        mode=SessionMode.BATCH,
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03",
         cache_tag="vendor-v2",
@@ -303,7 +327,7 @@ def test_fetch_session_by_id_reconstructs_complete_session() -> None:
 
 
 def test_fetch_session_by_id_reconstructs_absent_optional_context() -> None:
-    """Nullable handling-context fields reconstruct as None."""
+    """Nullable cache-context fields reconstruct as None."""
 
     expected = _session(
         ttl_seconds=None,
@@ -328,6 +352,74 @@ def test_fetch_session_by_id_reconstructs_absent_optional_context() -> None:
     )
 
     assert session == expected
+
+
+def test_fetch_session_by_id_converts_database_timestamps_to_mxm_timestamp() -> None:
+    """Psycopg datetime values reconstruct as canonical MXM timestamps."""
+
+    expected = _session(
+        ended_at=_ENDED_AT,
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    _session_row(expected),
+                ]
+            ),
+        ]
+    )
+
+    session = fetch_session_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        session_id=expected.id,
+    )
+
+    assert session is not None
+    assert session.started_at == _STARTED_AT
+    assert session.ended_at == _ENDED_AT
+
+
+def test_fetch_session_by_id_normalises_aware_database_timestamp_to_utc() -> None:
+    """Equivalent aware database timestamps reconstruct to one UTC instant."""
+
+    expected = _session()
+
+    row = _session_row(expected)
+
+    utc_plus_one = timezone(
+        timedelta(hours=1),
+    )
+
+    row = _row_with_value(
+        row,
+        6,
+        datetime(
+            2026,
+            9,
+            3,
+            10,
+            0,
+            tzinfo=utc_plus_one,
+        ),
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(rows=[row]),
+        ]
+    )
+
+    session = fetch_session_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        session_id=expected.id,
+    )
+
+    assert session is not None
+    assert session.started_at == _STARTED_AT
 
 
 def test_fetch_session_by_id_uses_configured_schema_and_identity() -> None:
@@ -355,7 +447,7 @@ def test_fetch_session_by_id_uses_configured_schema_and_identity() -> None:
 
 
 def test_fetch_session_by_id_rejects_invalid_identifier_before_sql() -> None:
-    """Invalid requested session identity fails before database access."""
+    """Invalid requested Session identity fails before database access."""
 
     connection = FakeConnection()
 
@@ -374,7 +466,7 @@ def test_fetch_session_by_id_rejects_invalid_identifier_before_sql() -> None:
 
 
 def test_fetch_session_by_id_rejects_multiple_database_rows() -> None:
-    """One session ID cannot reconstruct from multiple persisted rows."""
+    """One Session ID cannot reconstruct from multiple persisted rows."""
 
     session = _session()
 
@@ -453,14 +545,6 @@ _SESSION_ROW = _session_row(_session())
             _row_with_value(
                 _SESSION_ROW,
                 2,
-                "unknown-mode",
-            ),
-            r"mode is not recognised",
-        ),
-        (
-            _row_with_value(
-                _SESSION_ROW,
-                3,
                 "unknown-cache-mode",
             ),
             r"cache_mode is not recognised",
@@ -468,7 +552,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
+                3,
                 -1.0,
             ),
             r"ttl_seconds must be a finite non-negative number",
@@ -476,7 +560,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
+                3,
                 float("inf"),
             ),
             r"ttl_seconds must be a finite non-negative number",
@@ -484,7 +568,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                4,
+                3,
                 True,
             ),
             r"ttl_seconds must be a finite non-negative number",
@@ -492,7 +576,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                5,
+                4,
                 123,
             ),
             r"as_of_bucket must be text or NULL",
@@ -500,7 +584,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                6,
+                5,
                 123,
             ),
             r"cache_tag must be text or NULL",
@@ -508,7 +592,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                7,
+                6,
                 "2026-09-03T09:00:00Z",
             ),
             r"started_at must be a datetime",
@@ -516,7 +600,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                7,
+                6,
                 datetime(
                     2026,
                     9,
@@ -530,7 +614,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                8,
+                7,
                 "2026-09-03T09:30:00Z",
             ),
             r"ended_at must be a datetime",
@@ -538,7 +622,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                8,
+                7,
                 datetime(
                     2026,
                     9,
@@ -552,7 +636,7 @@ _SESSION_ROW = _session_row(_session())
         (
             _row_with_value(
                 _SESSION_ROW,
-                8,
+                7,
                 datetime(
                     2026,
                     9,
@@ -570,7 +654,7 @@ def test_fetch_session_by_id_rejects_invalid_rows(
     row: PostgresRow,
     error_match: str,
 ) -> None:
-    """Malformed persisted session rows cannot enter the domain."""
+    """Malformed persisted Session rows cannot enter the model."""
 
     connection = FakeConnection(
         [
@@ -595,7 +679,7 @@ def test_fetch_session_by_id_rejects_invalid_rows(
 
 
 def test_fetch_latest_session_id_returns_none_when_source_has_no_sessions() -> None:
-    """A source with no persisted sessions has no latest session ID."""
+    """A source with no persisted Sessions has no latest Session ID."""
 
     connection = FakeConnection(
         [
@@ -613,7 +697,7 @@ def test_fetch_latest_session_id_returns_none_when_source_has_no_sessions() -> N
 
 
 def test_fetch_latest_session_id_returns_persisted_identity() -> None:
-    """The latest-session query returns its persisted session ID."""
+    """The latest-Session query returns its persisted Session ID."""
 
     connection = FakeConnection(
         [
@@ -635,7 +719,7 @@ def test_fetch_latest_session_id_returns_persisted_identity() -> None:
 
 
 def test_fetch_latest_session_id_uses_source_and_deterministic_ordering() -> None:
-    """Latest-session lookup is source-specific with deterministic ties."""
+    """Latest-Session lookup is source-specific with deterministic ties."""
 
     connection = FakeConnection(
         [
@@ -698,7 +782,7 @@ def test_fetch_latest_session_id_rejects_invalid_source_before_sql() -> None:
 def test_fetch_latest_session_id_rejects_invalid_result(
     rows: list[PostgresRow],
 ) -> None:
-    """Malformed latest-session query results are rejected."""
+    """Malformed latest-Session query results are rejected."""
 
     connection = FakeConnection(
         [
@@ -720,11 +804,10 @@ def test_fetch_latest_session_id_rejects_invalid_result(
 
 
 def test_insert_session_encodes_complete_session_state() -> None:
-    """One Session is encoded with lifecycle and handling context."""
+    """One Session is encoded with lifecycle and cache context."""
 
     session = _session(
-        cache_mode=CacheMode.REVALIDATE,
-        mode=SessionMode.ASYNC,
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03",
         cache_tag="vendor-v2",
@@ -757,18 +840,17 @@ def test_insert_session_encodes_complete_session_state() -> None:
     assert execution.parameters == (
         session.id,
         session.source,
-        session.mode.value,
         session.cache_mode.value,
         session.ttl_seconds,
         session.as_of_bucket,
         session.cache_tag,
-        session.started_at,
-        session.ended_at,
+        _db_datetime(session.started_at),
+        (_db_datetime(session.ended_at) if session.ended_at is not None else None),
     )
 
 
 def test_insert_session_accepts_matching_persisted_state() -> None:
-    """An identical existing session is an idempotent replay."""
+    """An identical existing Session is an idempotent replay."""
 
     session = _session()
 
@@ -794,8 +876,8 @@ def test_insert_session_accepts_matching_persisted_state() -> None:
     assert "SELECT" in _query_text(connection.executions[1].query)
 
 
-def test_insert_session_rejects_conflicting_handling_context() -> None:
-    """One session ID cannot identify different handling context."""
+def test_insert_session_rejects_conflicting_cache_context() -> None:
+    """One Session ID cannot identify different cache context."""
 
     requested = _session(
         cache_mode=CacheMode.DEFAULT,
@@ -819,7 +901,7 @@ def test_insert_session_rejects_conflicting_handling_context() -> None:
 
     with pytest.raises(
         SessionConflictError,
-        match=r"Persisted session conflicts.*session-1",
+        match=r"Persisted Session conflicts.*session-1",
     ):
         insert_session(
             _as_connection(connection),
@@ -829,7 +911,7 @@ def test_insert_session_rejects_conflicting_handling_context() -> None:
 
 
 def test_insert_session_rejects_missing_state_after_insert() -> None:
-    """A requested session must exist after insertion."""
+    """A requested Session must exist after insertion."""
 
     session = _session()
 
@@ -849,6 +931,32 @@ def test_insert_session_rejects_missing_state_after_insert() -> None:
             schema="dataio_test_abc",
             session=session,
         )
+
+
+def test_insert_session_rejects_non_microsecond_aligned_timestamp() -> None:
+    """Persistence never silently truncates canonical nanosecond timestamps."""
+
+    invalid_timestamp = ts_ns_from_int(
+        ts_ns_to_int(_STARTED_AT) + 1,
+    )
+
+    session = _session(
+        started_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        SessionPersistenceError,
+        match=r"cannot be represented exactly.*microsecond precision",
+    ):
+        insert_session(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            session=session,
+        )
+
+    assert connection.cursor_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -883,38 +991,7 @@ def test_insert_session_rejects_missing_state_after_insert() -> None:
         ),
         (
             _session(
-                started_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    9,
-                    0,
-                ),
-            ),
-            r"started_at must be timezone-aware",
-        ),
-        (
-            _session(
-                ended_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    9,
-                    30,
-                ),
-            ),
-            r"ended_at must be timezone-aware",
-        ),
-        (
-            _session(
-                ended_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    8,
-                    59,
-                    tzinfo=UTC,
-                ),
+                ended_at=ts_ns_from_str("2026-09-03T08:59:00.000000000Z"),
             ),
             r"ended_at must not be before started_at",
         ),
@@ -948,10 +1025,10 @@ def test_insert_session_rejects_invalid_state_before_sql(
 
 
 def test_mark_session_ended_records_completion() -> None:
-    """An open persisted session can be completed once."""
+    """An open persisted Session can be completed once."""
 
     open_session = _session(
-        cache_mode=CacheMode.REVALIDATE,
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03",
         cache_tag="vendor-v2",
@@ -996,7 +1073,7 @@ def test_mark_session_ended_records_completion() -> None:
     assert "ended_at IS NULL" in update_query
 
     assert update_execution.parameters == (
-        _ENDED_AT,
+        _db_datetime(_ENDED_AT),
         open_session.id,
     )
 
@@ -1035,16 +1112,9 @@ def test_mark_session_ended_is_idempotent_for_same_timestamp() -> None:
 
 
 def test_mark_session_ended_rejects_different_existing_completion() -> None:
-    """A recorded session completion cannot be rewritten."""
+    """A recorded Session completion cannot be rewritten."""
 
-    existing_end = datetime(
-        2026,
-        9,
-        3,
-        9,
-        20,
-        tzinfo=UTC,
-    )
+    existing_end = ts_ns_from_str("2026-09-03T09:20:00.000000000Z")
 
     ended_session = _session(
         ended_at=existing_end,
@@ -1075,7 +1145,7 @@ def test_mark_session_ended_rejects_different_existing_completion() -> None:
 
 
 def test_mark_session_ended_rejects_unknown_session() -> None:
-    """A nonexistent session cannot be completed."""
+    """A nonexistent Session cannot be completed."""
 
     connection = FakeConnection(
         [
@@ -1096,18 +1166,11 @@ def test_mark_session_ended_rejects_unknown_session() -> None:
 
 
 def test_mark_session_ended_rejects_completion_before_start() -> None:
-    """A session cannot complete before its persisted start time."""
+    """A Session cannot complete before its persisted start time."""
 
     session = _session()
 
-    invalid_end = datetime(
-        2026,
-        9,
-        3,
-        8,
-        59,
-        tzinfo=UTC,
-    )
+    invalid_end = ts_ns_from_str("2026-09-03T08:59:00.000000000Z")
 
     connection = FakeConnection(
         [
@@ -1133,33 +1196,55 @@ def test_mark_session_ended_rejects_completion_before_start() -> None:
     assert connection.cursor_calls == 1
 
 
-def test_mark_session_ended_rejects_naive_timestamp_before_sql() -> None:
-    """Completion timestamps must be timezone-aware."""
+def test_mark_session_ended_rejects_noncanonical_timestamp_before_sql() -> None:
+    """Completion requires a canonical MXM timestamp."""
 
     connection = FakeConnection()
 
+    invalid_timestamp = cast(
+        TSNSScalar,
+        "2026-09-03T09:30:00Z",
+    )
+
     with pytest.raises(
         SessionPersistenceError,
-        match=r"ended_at must be timezone-aware",
+        match=r"ended_at must be a valid canonical MXM timestamp",
     ):
         mark_session_ended(
             _as_connection(connection),
             schema="dataio_test_abc",
             session_id="session-1",
-            ended_at=datetime(
-                2026,
-                9,
-                3,
-                9,
-                30,
-            ),
+            ended_at=invalid_timestamp,
+        )
+
+    assert connection.cursor_calls == 0
+
+
+def test_mark_session_ended_rejects_non_microsecond_aligned_timestamp() -> None:
+    """Completion never silently loses nanosecond precision."""
+
+    connection = FakeConnection()
+
+    invalid_timestamp = ts_ns_from_int(
+        ts_ns_to_int(_ENDED_AT) + 1,
+    )
+
+    with pytest.raises(
+        SessionPersistenceError,
+        match=r"cannot be represented exactly.*microsecond precision",
+    ):
+        mark_session_ended(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            session_id="session-1",
+            ended_at=invalid_timestamp,
         )
 
     assert connection.cursor_calls == 0
 
 
 def test_mark_session_ended_rejects_invalid_session_id_before_sql() -> None:
-    """Completion requires a valid persisted session identity."""
+    """Completion requires a valid persisted Session identity."""
 
     connection = FakeConnection()
 
@@ -1181,7 +1266,6 @@ def test_mark_session_ended_rejects_unexpected_post_update_state() -> None:
     """Completion must be visible with the requested value after updating."""
 
     open_session = _session()
-
     still_open_session = _session()
 
     connection = FakeConnection(

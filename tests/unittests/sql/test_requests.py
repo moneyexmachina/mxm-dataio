@@ -1,16 +1,16 @@
-"""Unit tests for plain-SQL DataIO request persistence operations."""
+"""Unit tests for plain-SQL DataIO Request persistence operations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal, Self, cast
 
 import pytest
 from psycopg import Connection, sql
 from psycopg.types.json import Jsonb
 
-from mxm.dataio.models import Request, RequestMethod
+from mxm.dataio.models import Request
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.requests import (
     RequestConflictError,
@@ -20,6 +20,12 @@ from mxm.dataio.sql.requests import (
     insert_request,
 )
 from mxm.types import JSONLike, JSONObj
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_int,
+    ts_ns_from_str,
+    ts_ns_to_int,
+)
 
 type ExecutableQuery = sql.SQL | sql.Composed
 
@@ -59,8 +65,6 @@ class FakeCursor:
         self._executions = executions
 
     def __enter__(self) -> Self:
-        """Enter the fake cursor context."""
-
         return self
 
     def __exit__(
@@ -69,7 +73,8 @@ class FakeCursor:
         exc_value: object,
         traceback: object,
     ) -> None:
-        """Exit the fake cursor context."""
+        _ = exc_type, exc_value, traceback
+        return None
 
     def execute(
         self,
@@ -110,8 +115,6 @@ class FakeConnection:
             cursor.bind_executions(self.executions)
 
     def cursor(self) -> FakeCursor:
-        """Return the next scripted cursor."""
-
         self.cursor_calls += 1
 
         if not self._cursors:
@@ -122,24 +125,42 @@ class FakeConnection:
         return self._cursors.pop(0)
 
     def commit(self) -> None:
-        """Record an unexpected commit request."""
-
         self.commit_calls += 1
 
     def rollback(self) -> None:
-        """Record an unexpected rollback request."""
-
         self.rollback_calls += 1
 
 
 def _as_connection(
     connection: FakeConnection,
 ) -> Connection[PostgresRow]:
-    """Cast a fake connection to the production connection type."""
-
     return cast(
         Connection[PostgresRow],
         connection,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Timestamp fixtures and boundary helpers
+# ---------------------------------------------------------------------------
+
+
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+_CREATED_AT = ts_ns_from_str("2026-09-03T10:00:00.123456000Z")
+
+
+def _db_datetime(
+    value: TSNSScalar,
+) -> datetime:
+    """Encode one microsecond-aligned MXM timestamp as fake Psycopg output."""
+
+    nanoseconds = ts_ns_to_int(value)
+
+    assert nanoseconds % 1_000 == 0
+
+    return _UNIX_EPOCH + timedelta(
+        microseconds=nanoseconds // 1_000,
     )
 
 
@@ -148,28 +169,21 @@ def _as_connection(
 # ---------------------------------------------------------------------------
 
 
-_CREATED_AT = datetime(2026, 9, 3, 10, 0, tzinfo=UTC)
-
-
 def _request(
     *,
     request_id: str = "request-1",
     session_id: str = "session-1",
     kind: str = "prices",
-    method: RequestMethod = RequestMethod.GET,
     params: JSONObj | None = None,
-    body: JSONLike | None = None,
-    created_at: datetime = _CREATED_AT,
+    created_at: TSNSScalar = _CREATED_AT,
 ) -> Request:
-    """Construct one representative immutable request occurrence."""
+    """Construct one representative immutable Request occurrence."""
 
     return Request(
         id=request_id,
         session_id=session_id,
         kind=kind,
-        method=method,
         params=params,
-        body=body,
         created_at=created_at,
     )
 
@@ -177,17 +191,15 @@ def _request(
 def _request_row(
     request: Request,
 ) -> PostgresRow:
-    """Encode one Request as a PostgreSQL result row."""
+    """Encode one Request as a fake Psycopg PostgreSQL result row."""
 
     return (
         request.id,
         request.session_id,
         request.kind,
-        request.method.value,
         request.params,
-        request.body,
         request.hash,
-        request.created_at,
+        _db_datetime(request.created_at),
     )
 
 
@@ -199,8 +211,6 @@ def _request_row(
 def _row(
     *values: object,
 ) -> PostgresRow:
-    """Construct an arbitrary PostgreSQL result row."""
-
     return tuple(values)
 
 
@@ -209,8 +219,6 @@ def _row_with_value(
     index: int,
     value: object,
 ) -> PostgresRow:
-    """Return a PostgreSQL row with one value replaced."""
-
     values = list(row)
 
     if index < 0 or index >= len(values):
@@ -227,32 +235,22 @@ def _row_with_value(
 def _query_text(
     query: ExecutableQuery,
 ) -> str:
-    """Render and normalise one composed SQL query."""
-
     return " ".join(query.as_string().split())
 
 
 def _single_execution(
     connection: FakeConnection,
 ) -> Execution:
-    """Return the sole recorded SQL operation."""
-
     assert len(connection.executions) == 1
-
     return connection.executions[0]
 
 
 def _execution_parameters(
     execution: Execution,
 ) -> tuple[object, ...]:
-    """Return typed parameters from one execute operation."""
-
     parameters = execution.parameters
 
-    if not isinstance(
-        parameters,
-        tuple,
-    ):
+    if not isinstance(parameters, tuple):
         raise AssertionError(f"Expected tuple execution parameters, got {parameters!r}")
 
     return cast(
@@ -262,12 +260,12 @@ def _execution_parameters(
 
 
 # ---------------------------------------------------------------------------
-# Question identity
+# Logical-question identity
 # ---------------------------------------------------------------------------
 
 
 def test_request_occurrences_can_share_question_identity() -> None:
-    """Different occurrences may represent exactly the same question."""
+    """Different occurrences may represent exactly the same logical question."""
 
     first = _request(
         request_id="request-1",
@@ -299,14 +297,7 @@ def test_request_occurrences_can_share_question_identity() -> None:
         ),
         _request(
             request_id="request-2",
-            created_at=datetime(
-                2026,
-                9,
-                3,
-                11,
-                0,
-                tzinfo=UTC,
-            ),
+            created_at=ts_ns_from_str("2026-09-03T11:00:00.000000000Z"),
         ),
     ],
 )
@@ -331,18 +322,8 @@ def test_occurrence_metadata_does_not_change_question_hash(
         ),
         _request(
             request_id="request-2",
-            method=RequestMethod.POST,
-        ),
-        _request(
-            request_id="request-2",
             params={
                 "symbol": "DIFFERENT",
-            },
-        ),
-        _request(
-            request_id="request-2",
-            body={
-                "command": "different",
             },
         ),
     ],
@@ -350,7 +331,7 @@ def test_occurrence_metadata_does_not_change_question_hash(
 def test_question_fields_change_request_hash(
     second: Request,
 ) -> None:
-    """Changing one question-bearing field changes question identity."""
+    """Changing one logical question-bearing field changes identity."""
 
     first = _request(
         request_id="request-1",
@@ -365,8 +346,6 @@ def test_question_fields_change_request_hash(
 
 
 def test_fetch_request_by_id_returns_none_when_absent() -> None:
-    """A missing request occurrence returns no persisted request."""
-
     connection = FakeConnection(
         [
             FakeCursor(rows=[]),
@@ -387,13 +366,12 @@ def test_fetch_request_by_id_reconstructs_request() -> None:
     """A persisted row reconstructs the complete Request object."""
 
     expected = _request(
-        method=RequestMethod.POST,
         params={
             "symbol": "TEST",
             "limit": 10,
-        },
-        body={
-            "query": "value",
+            "filters": {
+                "venue": "CME",
+            },
         },
     )
 
@@ -416,9 +394,70 @@ def test_fetch_request_by_id_reconstructs_request() -> None:
     assert request == expected
 
 
-def test_fetch_request_by_id_uses_configured_schema_and_identity() -> None:
-    """Request lookup uses the configured schema and occurrence ID."""
+def test_fetch_request_by_id_converts_database_timestamp_to_mxm_timestamp() -> None:
+    expected = _request()
 
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    _request_row(expected),
+                ]
+            ),
+        ]
+    )
+
+    request = fetch_request_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        request_id=expected.id,
+    )
+
+    assert request is not None
+    assert request.created_at == expected.created_at
+
+
+def test_fetch_request_by_id_normalises_aware_database_timestamp_to_utc() -> None:
+    """Equivalent aware database timestamps reconstruct to one canonical instant."""
+
+    expected = _request(created_at=ts_ns_from_str("2026-09-03T09:00:00.000000000Z"))
+
+    row = _request_row(expected)
+
+    utc_plus_one = timezone(
+        timedelta(hours=1),
+    )
+
+    row = _row_with_value(
+        row,
+        5,
+        datetime(
+            2026,
+            9,
+            3,
+            10,
+            0,
+            tzinfo=utc_plus_one,
+        ),
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(rows=[row]),
+        ]
+    )
+
+    request = fetch_request_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        request_id=expected.id,
+    )
+
+    assert request is not None
+    assert request.created_at == expected.created_at
+
+
+def test_fetch_request_by_id_uses_configured_schema_and_identity() -> None:
     connection = FakeConnection(
         [
             FakeCursor(rows=[]),
@@ -441,8 +480,6 @@ def test_fetch_request_by_id_uses_configured_schema_and_identity() -> None:
 
 
 def test_fetch_request_by_id_rejects_invalid_identifier_before_sql() -> None:
-    """Invalid occurrence identity fails before database access."""
-
     connection = FakeConnection()
 
     with pytest.raises(
@@ -460,8 +497,6 @@ def test_fetch_request_by_id_rejects_invalid_identifier_before_sql() -> None:
 
 
 def test_fetch_request_by_id_rejects_multiple_database_rows() -> None:
-    """One occurrence ID cannot reconstruct from multiple persisted rows."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -531,14 +566,6 @@ _REQUEST_ROW = _request_row(_request())
             _row_with_value(
                 _REQUEST_ROW,
                 3,
-                "NOT_A_METHOD",
-            ),
-            r"method is not recognised",
-        ),
-        (
-            _row_with_value(
-                _REQUEST_ROW,
-                4,
                 ["not-an-object"],
             ),
             r"params must be a JSON object",
@@ -546,15 +573,7 @@ _REQUEST_ROW = _request_row(_request())
         (
             _row_with_value(
                 _REQUEST_ROW,
-                5,
-                object(),
-            ),
-            r"body must contain JSON-compatible values",
-        ),
-        (
-            _row_with_value(
-                _REQUEST_ROW,
-                6,
+                4,
                 "not-a-hash",
             ),
             r"64-character lowercase hexadecimal",
@@ -562,7 +581,7 @@ _REQUEST_ROW = _request_row(_request())
         (
             _row_with_value(
                 _REQUEST_ROW,
-                7,
+                5,
                 "2026-09-03T10:00:00Z",
             ),
             r"created_at must be a datetime",
@@ -570,7 +589,7 @@ _REQUEST_ROW = _request_row(_request())
         (
             _row_with_value(
                 _REQUEST_ROW,
-                7,
+                5,
                 datetime(
                     2026,
                     9,
@@ -587,7 +606,7 @@ def test_fetch_request_by_id_rejects_invalid_rows(
     row: PostgresRow,
     error_match: str,
 ) -> None:
-    """Malformed persisted request rows cannot enter the domain."""
+    """Malformed persisted Request rows cannot enter the model."""
 
     connection = FakeConnection(
         [
@@ -607,11 +626,11 @@ def test_fetch_request_by_id_rejects_invalid_rows(
 
 
 def test_fetch_request_by_id_rejects_hash_inconsistent_with_question() -> None:
-    """Persisted hash must agree with the question-bearing fields."""
+    """Persisted hash must agree with kind + params."""
 
     row = _row_with_value(
         _REQUEST_ROW,
-        6,
+        4,
         "0" * 64,
     )
 
@@ -623,7 +642,7 @@ def test_fetch_request_by_id_rejects_hash_inconsistent_with_question() -> None:
 
     with pytest.raises(
         RequestPersistenceError,
-        match=r"hash is inconsistent with question identity",
+        match=r"hash is inconsistent with logical-question identity",
     ):
         fetch_request_by_id(
             _as_connection(connection),
@@ -638,8 +657,6 @@ def test_fetch_request_by_id_rejects_hash_inconsistent_with_question() -> None:
 
 
 def test_fetch_requests_by_hash_returns_empty_mapping() -> None:
-    """A question identity with no occurrences produces an empty mapping."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -658,22 +675,13 @@ def test_fetch_requests_by_hash_returns_empty_mapping() -> None:
 
 
 def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
-    """Occurrences sharing a question hash remain independently represented."""
-
     first = _request(
         request_id="request-1",
         session_id="session-1",
         params={
             "symbol": "ES",
         },
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            0,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T10:00:00.000000000Z"),
     )
 
     second = _request(
@@ -682,14 +690,7 @@ def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
         params={
             "symbol": "ES",
         },
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            11,
-            0,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T11:00:00.000000000Z"),
     )
 
     assert first.hash == second.hash
@@ -720,8 +721,6 @@ def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
 
 
 def test_fetch_requests_by_hash_uses_hash_filter_and_deterministic_ordering() -> None:
-    """Question lookup uses hash and deterministic occurrence ordering."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -746,8 +745,6 @@ def test_fetch_requests_by_hash_uses_hash_filter_and_deterministic_ordering() ->
 
 
 def test_fetch_requests_by_hash_rejects_invalid_hash_before_sql() -> None:
-    """Question identity must be a valid SHA-256 value."""
-
     connection = FakeConnection()
 
     with pytest.raises(
@@ -765,8 +762,6 @@ def test_fetch_requests_by_hash_rejects_invalid_hash_before_sql() -> None:
 
 
 def test_fetch_requests_by_hash_rejects_duplicate_occurrence_identity() -> None:
-    """A result set cannot contain one request occurrence twice."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -782,7 +777,7 @@ def test_fetch_requests_by_hash_rejects_duplicate_occurrence_identity() -> None:
 
     with pytest.raises(
         RequestPersistenceError,
-        match=r"duplicate request occurrence.*request-1",
+        match=r"duplicate Request occurrence ID.*request-1",
     ):
         fetch_requests_by_hash(
             _as_connection(connection),
@@ -797,19 +792,13 @@ def test_fetch_requests_by_hash_rejects_duplicate_occurrence_identity() -> None:
 
 
 def test_insert_request_encodes_complete_request_state() -> None:
-    """One Request is encoded into the expected SQL representation."""
-
     request = _request(
-        method=RequestMethod.POST,
         params={
             "symbol": "TEST",
             "limit": 10,
-        },
-        body={
-            "query": [
-                "a",
-                "b",
-            ],
+            "filters": {
+                "venue": "CME",
+            },
         },
     )
 
@@ -839,37 +828,27 @@ def test_insert_request_encodes_complete_request_state() -> None:
 
     parameters = _execution_parameters(execution)
 
-    assert len(parameters) == 8
+    assert len(parameters) == 6
 
     assert parameters[0] == request.id
     assert parameters[1] == request.session_id
     assert parameters[2] == request.kind
-    assert parameters[3] == request.method.value
 
-    params_json = parameters[4]
+    params_json = parameters[3]
+
     assert isinstance(
         params_json,
         Jsonb,
     )
     assert params_json.obj == request.params
 
-    body_json = parameters[5]
-    assert isinstance(
-        body_json,
-        Jsonb,
-    )
-    assert body_json.obj == request.body
-
-    assert parameters[6] == request.hash
-    assert parameters[7] == request.created_at
+    assert parameters[4] == request.hash
+    assert parameters[5] == _db_datetime(request.created_at)
 
 
-def test_insert_request_encodes_absent_json_values_as_null() -> None:
-    """Absent params and body are passed to PostgreSQL as NULL."""
-
+def test_insert_request_encodes_absent_params_as_null() -> None:
     request = _request(
         params=None,
-        body=None,
     )
 
     connection = FakeConnection(
@@ -891,12 +870,11 @@ def test_insert_request_encodes_absent_json_values_as_null() -> None:
 
     parameters = _execution_parameters(connection.executions[0])
 
-    assert parameters[4] is None
-    assert parameters[5] is None
+    assert parameters[3] is None
 
 
 def test_insert_request_uses_occurrence_identity_conflict_clause() -> None:
-    """Persistence conflicts on Q identity, not question hash."""
+    """Persistence conflicts on Q identity, not logical-question hash."""
 
     request = _request()
 
@@ -929,8 +907,6 @@ def test_insert_request_uses_occurrence_identity_conflict_clause() -> None:
 
 
 def test_insert_request_accepts_matching_persisted_state() -> None:
-    """Identical persisted occurrence state is an idempotent replay."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -956,8 +932,6 @@ def test_insert_request_accepts_matching_persisted_state() -> None:
 
 
 def test_insert_request_rejects_conflicting_persisted_occurrence() -> None:
-    """One request ID cannot identify two different occurrences."""
-
     requested = _request()
 
     persisted = _request(
@@ -978,7 +952,7 @@ def test_insert_request_rejects_conflicting_persisted_occurrence() -> None:
 
     with pytest.raises(
         RequestConflictError,
-        match=r"Persisted request conflicts.*request-1",
+        match=r"Persisted Request conflicts.*request-1",
     ):
         insert_request(
             _as_connection(connection),
@@ -988,8 +962,6 @@ def test_insert_request_rejects_conflicting_persisted_occurrence() -> None:
 
 
 def test_insert_request_rejects_missing_state_after_insert() -> None:
-    """The requested occurrence must exist after insertion."""
-
     request = _request()
 
     connection = FakeConnection(
@@ -1039,26 +1011,12 @@ def test_insert_request_rejects_missing_state_after_insert() -> None:
             ),
             r"kind must be non-empty text",
         ),
-        (
-            _request(
-                created_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    10,
-                    0,
-                ),
-            ),
-            r"created_at must be timezone-aware",
-        ),
     ],
 )
 def test_insert_request_rejects_invalid_state_before_sql(
     request_occurrence: Request,
     error_match: str,
 ) -> None:
-    """Invalid persistence invariants fail before database access."""
-
     connection = FakeConnection()
 
     with pytest.raises(
@@ -1073,6 +1031,57 @@ def test_insert_request_rejects_invalid_state_before_sql(
 
     assert connection.cursor_calls == 0
     assert connection.executions == []
+
+
+def test_insert_request_rejects_noncanonical_timestamp_before_sql() -> None:
+    connection = FakeConnection()
+
+    invalid_timestamp = cast(
+        TSNSScalar,
+        "2026-09-03T10:00:00Z",
+    )
+
+    request = _request(
+        created_at=invalid_timestamp,
+    )
+
+    with pytest.raises(
+        RequestPersistenceError,
+        match=r"created_at must be a valid canonical MXM timestamp",
+    ):
+        insert_request(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            request=request,
+        )
+
+    assert connection.cursor_calls == 0
+
+
+def test_insert_request_rejects_non_microsecond_aligned_timestamp() -> None:
+    """Persistence never silently truncates canonical nanosecond timestamps."""
+
+    invalid_timestamp = ts_ns_from_int(
+        ts_ns_to_int(_CREATED_AT) + 1,
+    )
+
+    request = _request(
+        created_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        RequestPersistenceError,
+        match=r"cannot be represented exactly.*microsecond precision",
+    ):
+        insert_request(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            request=request,
+        )
+
+    assert connection.cursor_calls == 0
 
 
 def test_insert_request_rejects_nested_identity_mutation_before_sql() -> None:
@@ -1090,13 +1099,14 @@ def test_insert_request_rejects_nested_identity_mutation_before_sql() -> None:
         dict[str, JSONLike],
         request.params,
     )
+
     mutable_params["symbol"] = "DIFFERENT"
 
     connection = FakeConnection()
 
     with pytest.raises(
         RequestPersistenceError,
-        match=r"hash is inconsistent with question identity",
+        match=r"hash is inconsistent with logical-question identity",
     ):
         insert_request(
             _as_connection(connection),
@@ -1109,8 +1119,6 @@ def test_insert_request_rejects_nested_identity_mutation_before_sql() -> None:
 
 
 def test_insert_request_rejects_nested_non_json_params_before_sql() -> None:
-    """Invalid nested params state cannot cross the persistence boundary."""
-
     request = _request(
         params={
             "bad": "initially-valid",
@@ -1123,6 +1131,7 @@ def test_insert_request_rejects_nested_non_json_params_before_sql() -> None:
         dict[str, object],
         request.params,
     )
+
     mutable_params["bad"] = object()
 
     connection = FakeConnection()
@@ -1147,8 +1156,6 @@ def test_insert_request_rejects_nested_non_json_params_before_sql() -> None:
 
 
 def test_request_operations_do_not_control_transactions() -> None:
-    """Request SQL helpers neither commit nor roll back transactions."""
-
     request = _request()
 
     connection = FakeConnection(

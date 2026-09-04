@@ -1,20 +1,26 @@
 """PostgreSQL integration tests for DataIO Resolution persistence.
 
-These tests exercise the real migrated PostgreSQL schema. They prove that the
-Resolution SQL adapter matches that schema, that acquired and reused
-Resolutions preserve the intended Request/Response semantics, that one Response
-may satisfy multiple Request occurrences, and that Resolution identity,
-foreign-key, and conflict semantics behave correctly through real PostgreSQL.
+These tests exercise the real migrated PostgreSQL schema and Psycopg boundary.
 
-Detailed SQL construction, row validation, and transaction non-ownership are
-tested separately by the Resolution unit tests.
+They prove that:
+
+- acquired and reused Resolutions round-trip through PostgreSQL;
+- canonical MXM timestamps survive the real PostgreSQL timestamp boundary;
+- ACQUIRED and REUSED preserve their Request/Response provenance semantics;
+- one Response may satisfy multiple Request occurrences;
+- one Request occurrence has at most one final Resolution;
+- Resolution.request_id is relationally constrained to a persisted Request;
+- Resolution persistence is idempotent while conflicting identity is rejected.
+
+Detailed SQL construction, malformed-row handling, timestamp-boundary
+validation, structural relationship validation, and transaction non-ownership
+are tested separately by the Resolution unit tests.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from datetime import UTC, datetime
 
 import pytest
 from psycopg.errors import ForeignKeyViolation
@@ -27,7 +33,6 @@ from mxm.dataio.models import (
     Response,
     ResponseStatus,
     Session,
-    SessionMode,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import insert_request
@@ -40,6 +45,10 @@ from mxm.dataio.sql.resolutions import (
 )
 from mxm.dataio.sql.responses import insert_response
 from mxm.dataio.sql.sessions import insert_session
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_str,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -64,6 +73,7 @@ def _session(
     session_id: str,
     source: str = "test-source",
     cache_mode: CacheMode = CacheMode.DEFAULT,
+    started_at: TSNSScalar | None = None,
 ) -> Session:
     """Construct one deterministic parent DataIO Session."""
 
@@ -71,14 +81,10 @@ def _session(
         id=session_id,
         source=source,
         cache_mode=cache_mode,
-        mode=SessionMode.SYNC,
-        started_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            0,
-            tzinfo=UTC,
+        started_at=(
+            started_at
+            if started_at is not None
+            else ts_ns_from_str("2026-09-03T10:00:00.123456000Z")
         ),
     )
 
@@ -87,7 +93,7 @@ def _request(
     *,
     request_id: str,
     session_id: str,
-    created_at: datetime | None = None,
+    created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one deterministic Request occurrence."""
 
@@ -101,14 +107,7 @@ def _request(
         created_at=(
             created_at
             if created_at is not None
-            else datetime(
-                2026,
-                9,
-                3,
-                10,
-                1,
-                tzinfo=UTC,
-            )
+            else ts_ns_from_str("2026-09-03T10:01:00.234567000Z")
         ),
     )
 
@@ -118,6 +117,8 @@ def _response(
     response_id: str,
     request_id: str,
     payload: bytes = b"payload",
+    created_at: TSNSScalar | None = None,
+    fetched_at: TSNSScalar | None = None,
 ) -> Response:
     """Construct one deterministic external Response observation."""
 
@@ -131,22 +132,15 @@ def _response(
         size_bytes=len(
             payload,
         ),
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            2,
-            tzinfo=UTC,
+        created_at=(
+            created_at
+            if created_at is not None
+            else ts_ns_from_str("2026-09-03T10:02:00.345678000Z")
         ),
-        fetched_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            2,
-            1,
-            tzinfo=UTC,
+        fetched_at=(
+            fetched_at
+            if fetched_at is not None
+            else ts_ns_from_str("2026-09-03T10:02:01.456789000Z")
         ),
     )
 
@@ -156,7 +150,7 @@ def _resolution(
     request_id: str,
     response_id: str,
     kind: ResolutionKind,
-    resolved_at: datetime | None = None,
+    resolved_at: TSNSScalar | None = None,
 ) -> Resolution:
     """Construct one deterministic final Request Resolution."""
 
@@ -167,14 +161,7 @@ def _resolution(
         resolved_at=(
             resolved_at
             if resolved_at is not None
-            else datetime(
-                2026,
-                9,
-                3,
-                10,
-                3,
-                tzinfo=UTC,
-            )
+            else ts_ns_from_str("2026-09-03T10:03:00.567890000Z")
         ),
     )
 
@@ -239,6 +226,7 @@ def test_acquired_resolution_round_trips_through_postgres(
         request_id=request.id,
         response_id=response.id,
         kind=ResolutionKind.ACQUIRED,
+        resolved_at=ts_ns_from_str("2026-09-03T10:03:00.654321000Z"),
     )
 
     _insert_acquired_observation(
@@ -280,7 +268,7 @@ def test_acquired_resolution_round_trips_through_postgres(
 def test_reused_resolution_references_existing_observation(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Q2 may resolve by reusing an observation acquired by Q1."""
+    """Q2 may resolve by reusing a Response acquired by Q1."""
 
     database = migrated_postgres_database
 
@@ -293,67 +281,42 @@ def test_reused_resolution_references_existing_observation(
     acquiring_request = _request(
         request_id="request-1",
         session_id=acquiring_session.id,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            1,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T10:01:00.000000000Z"),
     )
 
     response = _response(
         response_id="response-1",
         request_id=acquiring_request.id,
         payload=b"reusable observation",
+        created_at=ts_ns_from_str("2026-09-03T10:02:00.000000000Z"),
+        fetched_at=ts_ns_from_str("2026-09-03T10:02:01.000000000Z"),
     )
 
     reusing_session = _session(
         session_id="session-reusing",
         source="source-a",
         cache_mode=CacheMode.ONLY_IF_CACHED,
+        started_at=ts_ns_from_str("2026-09-03T10:04:00.000000000Z"),
     )
 
     reusing_request = _request(
         request_id="request-2",
         session_id=reusing_session.id,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            5,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T10:05:00.000000000Z"),
     )
 
     acquired_resolution = _resolution(
         request_id=acquiring_request.id,
         response_id=response.id,
         kind=ResolutionKind.ACQUIRED,
-        resolved_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            3,
-            tzinfo=UTC,
-        ),
+        resolved_at=ts_ns_from_str("2026-09-03T10:03:00.000000000Z"),
     )
 
     reused_resolution = _resolution(
         request_id=reusing_request.id,
         response_id=response.id,
         kind=ResolutionKind.REUSED,
-        resolved_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            6,
-            tzinfo=UTC,
-        ),
+        resolved_at=ts_ns_from_str("2026-09-03T10:06:00.000000000Z"),
     )
 
     assert acquiring_request.hash == reusing_request.hash
@@ -439,7 +402,7 @@ def test_reused_resolution_references_existing_observation(
 def test_acquired_resolution_rejects_observation_from_different_request(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """ACQUIRED cannot falsely claim another Request's observation."""
+    """ACQUIRED cannot falsely claim another Request's Response."""
 
     database = migrated_postgres_database
 
@@ -455,6 +418,7 @@ def test_acquired_resolution_rejects_observation_from_different_request(
     second_request = _request(
         request_id="request-2",
         session_id=session.id,
+        created_at=ts_ns_from_str("2026-09-03T10:01:01.000000000Z"),
     )
 
     response = _response(
@@ -517,7 +481,7 @@ def test_acquired_resolution_rejects_observation_from_different_request(
 def test_reused_resolution_rejects_observation_from_same_request(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """REUSED cannot describe an observation actually acquired by that Q."""
+    """REUSED cannot describe a Response actually acquired by that Q."""
 
     database = migrated_postgres_database
 
@@ -600,6 +564,8 @@ def test_resolution_persistence_is_idempotent_and_rejects_identity_conflicts(
         response_id="response-2",
         request_id=request.id,
         payload=b"second observation",
+        created_at=ts_ns_from_str("2026-09-03T10:02:02.000000000Z"),
+        fetched_at=ts_ns_from_str("2026-09-03T10:02:03.000000000Z"),
     )
 
     resolution = _resolution(
@@ -654,7 +620,7 @@ def test_resolution_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     with pytest.raises(
         ResolutionConflictError,
-        match=r"Persisted resolution conflicts.*request-resolution-conflict",
+        match=r"Persisted Resolution conflicts.*request-resolution-conflict",
     ):
         with database.transaction() as connection:
             insert_resolution(

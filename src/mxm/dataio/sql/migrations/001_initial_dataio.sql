@@ -2,7 +2,6 @@ CREATE TABLE {schema}.sessions (
     id text PRIMARY KEY,
     source text NOT NULL,
 
-    mode text NOT NULL,
     cache_mode text NOT NULL,
     ttl_seconds double precision,
     as_of_bucket text,
@@ -17,9 +16,6 @@ CREATE TABLE {schema}.sessions (
     CONSTRAINT sessions_source_non_empty
         CHECK (source <> ''),
 
-    CONSTRAINT sessions_mode_non_empty
-        CHECK (mode <> ''),
-
     CONSTRAINT sessions_cache_mode_non_empty
         CHECK (cache_mode <> ''),
 
@@ -29,27 +25,26 @@ CREATE TABLE {schema}.sessions (
             OR ttl_seconds >= 0
         )
 );
+
+
 CREATE TABLE {schema}.requests (
     id text PRIMARY KEY,
     session_id text NOT NULL,
 
     kind text NOT NULL,
-    method text NOT NULL,
     params jsonb,
-    body jsonb,
 
     hash text NOT NULL,
-
     created_at timestamptz NOT NULL,
 
     CONSTRAINT requests_id_non_empty
         CHECK (id <> ''),
 
+    CONSTRAINT requests_session_id_non_empty
+        CHECK (session_id <> ''),
+
     CONSTRAINT requests_kind_non_empty
         CHECK (kind <> ''),
-
-    CONSTRAINT requests_method_non_empty
-        CHECK (method <> ''),
 
     CONSTRAINT requests_hash_sha256
         CHECK (hash ~ '^[0-9a-f]{64}$'),
@@ -64,12 +59,13 @@ CREATE TABLE {schema}.requests (
         FOREIGN KEY (session_id)
         REFERENCES {schema}.sessions (id)
 );
+
+
 CREATE TABLE {schema}.responses (
     id text PRIMARY KEY,
     request_id text NOT NULL,
 
     status text NOT NULL,
-    sequence integer,
 
     created_at timestamptz NOT NULL,
     fetched_at timestamptz NOT NULL,
@@ -85,14 +81,11 @@ CREATE TABLE {schema}.responses (
     CONSTRAINT responses_id_non_empty
         CHECK (id <> ''),
 
+    CONSTRAINT responses_request_id_non_empty
+        CHECK (request_id <> ''),
+
     CONSTRAINT responses_status_non_empty
         CHECK (status <> ''),
-
-    CONSTRAINT responses_sequence_non_negative
-        CHECK (
-            sequence IS NULL
-            OR sequence >= 0
-        ),
 
     CONSTRAINT responses_payload_checksum_sha256
         CHECK (payload_checksum ~ '^[0-9a-f]{64}$'),
@@ -117,11 +110,18 @@ CREATE TABLE {schema}.responses (
         REFERENCES {schema}.requests (id)
 );
 
+
 CREATE TABLE {schema}.resolutions (
     request_id text PRIMARY KEY,
     response_id text NOT NULL,
     kind text NOT NULL,
     resolved_at timestamptz NOT NULL,
+
+    CONSTRAINT resolutions_request_id_non_empty
+        CHECK (request_id <> ''),
+
+    CONSTRAINT resolutions_response_id_non_empty
+        CHECK (response_id <> ''),
 
     CONSTRAINT resolutions_kind_valid
         CHECK (

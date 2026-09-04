@@ -1,10 +1,10 @@
-"""Unit tests for plain-SQL DataIO response persistence operations."""
+"""Unit tests for plain-SQL DataIO Response persistence operations."""
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal, Self, cast
 
 import pytest
@@ -22,6 +22,12 @@ from mxm.dataio.sql.responses import (
     insert_response,
 )
 from mxm.types import JSONObj
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_int,
+    ts_ns_from_str,
+    ts_ns_to_int,
+)
 
 type ExecutableQuery = sql.SQL | sql.Composed
 
@@ -61,8 +67,6 @@ class FakeCursor:
         self._executions = executions
 
     def __enter__(self) -> Self:
-        """Enter the fake cursor context."""
-
         return self
 
     def __exit__(
@@ -71,7 +75,8 @@ class FakeCursor:
         exc_value: object,
         traceback: object,
     ) -> None:
-        """Exit the fake cursor context."""
+        _ = exc_type, exc_value, traceback
+        return None
 
     def execute(
         self,
@@ -112,8 +117,6 @@ class FakeConnection:
             cursor.bind_executions(self.executions)
 
     def cursor(self) -> FakeCursor:
-        """Return the next scripted cursor."""
-
         self.cursor_calls += 1
 
         if not self._cursors:
@@ -124,21 +127,15 @@ class FakeConnection:
         return self._cursors.pop(0)
 
     def commit(self) -> None:
-        """Record an unexpected commit request."""
-
         self.commit_calls += 1
 
     def rollback(self) -> None:
-        """Record an unexpected rollback request."""
-
         self.rollback_calls += 1
 
 
 def _as_connection(
     connection: FakeConnection,
 ) -> Connection[PostgresRow]:
-    """Cast a fake connection to the production connection type."""
-
     return cast(
         Connection[PostgresRow],
         connection,
@@ -146,12 +143,34 @@ def _as_connection(
 
 
 # ---------------------------------------------------------------------------
-# Response fixtures
+# Timestamp fixtures and boundary helpers
 # ---------------------------------------------------------------------------
 
 
-_CREATED_AT = datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
-_FETCHED_AT = datetime(2026, 9, 3, 8, 0, 1, tzinfo=UTC)
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+_CREATED_AT = ts_ns_from_str("2026-09-03T08:00:00.123456000Z")
+
+_FETCHED_AT = ts_ns_from_str("2026-09-03T08:00:01.654321000Z")
+
+
+def _db_datetime(
+    value: TSNSScalar,
+) -> datetime:
+    """Encode one microsecond-aligned MXM timestamp as fake Psycopg output."""
+
+    nanoseconds = ts_ns_to_int(value)
+
+    assert nanoseconds % 1_000 == 0
+
+    return _UNIX_EPOCH + timedelta(
+        microseconds=nanoseconds // 1_000,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Response fixtures
+# ---------------------------------------------------------------------------
 
 
 def _checksum(
@@ -167,9 +186,8 @@ def _response(
     response_id: str = "response-1",
     request_id: str = "request-1",
     status: ResponseStatus = ResponseStatus.OK,
-    sequence: int | None = None,
-    created_at: datetime = _CREATED_AT,
-    fetched_at: datetime = _FETCHED_AT,
+    created_at: TSNSScalar = _CREATED_AT,
+    fetched_at: TSNSScalar = _FETCHED_AT,
     payload_checksum: str | None = None,
     size_bytes: int = 7,
     media_type: str | None = None,
@@ -177,13 +195,12 @@ def _response(
     elapsed_ms: int | None = None,
     adapter_meta: JSONObj | None = None,
 ) -> Response:
-    """Construct one representative immutable response observation."""
+    """Construct one representative immutable Response observation."""
 
     return Response(
         id=response_id,
         request_id=request_id,
         status=status,
-        sequence=sequence,
         created_at=created_at,
         fetched_at=fetched_at,
         payload_checksum=(
@@ -200,15 +217,14 @@ def _response(
 def _response_row(
     response: Response,
 ) -> PostgresRow:
-    """Encode one Response as a PostgreSQL result row."""
+    """Encode one Response as a fake Psycopg PostgreSQL result row."""
 
     return (
         response.id,
         response.request_id,
         response.status.value,
-        response.sequence,
-        response.created_at,
-        response.fetched_at,
+        _db_datetime(response.created_at),
+        _db_datetime(response.fetched_at),
         response.payload_checksum,
         response.size_bytes,
         response.media_type,
@@ -226,8 +242,6 @@ def _response_row(
 def _row(
     *values: object,
 ) -> PostgresRow:
-    """Construct an arbitrary PostgreSQL result row."""
-
     return tuple(values)
 
 
@@ -236,8 +250,6 @@ def _row_with_value(
     index: int,
     value: object,
 ) -> PostgresRow:
-    """Return a PostgreSQL row with one value replaced."""
-
     values = list(row)
 
     if index < 0 or index >= len(values):
@@ -254,38 +266,57 @@ def _row_with_value(
 def _query_text(
     query: ExecutableQuery,
 ) -> str:
-    """Render and normalise one composed SQL query."""
-
     return " ".join(query.as_string().split())
 
 
 def _single_execution(
     connection: FakeConnection,
 ) -> Execution:
-    """Return the sole recorded SQL operation."""
-
     assert len(connection.executions) == 1
-
     return connection.executions[0]
 
 
 def _execution_parameters(
     execution: Execution,
 ) -> tuple[object, ...]:
-    """Return typed parameters from one execute operation."""
-
     parameters = execution.parameters
 
-    if not isinstance(
-        parameters,
-        tuple,
-    ):
+    if not isinstance(parameters, tuple):
         raise AssertionError(f"Expected tuple execution parameters, got {parameters!r}")
 
     return cast(
         tuple[object, ...],
         parameters,
     )
+
+
+# ---------------------------------------------------------------------------
+# Response / payload identity
+# ---------------------------------------------------------------------------
+
+
+def test_distinct_responses_can_share_payload_identity() -> None:
+    """Different external observations may contain identical exact bytes."""
+
+    payload_checksum = _checksum(b"same bytes")
+
+    first = _response(
+        response_id="response-1",
+        request_id="request-1",
+        payload_checksum=payload_checksum,
+        size_bytes=len(b"same bytes"),
+    )
+
+    second = _response(
+        response_id="response-2",
+        request_id="request-2",
+        payload_checksum=payload_checksum,
+        size_bytes=len(b"same bytes"),
+    )
+
+    assert first.id != second.id
+    assert first.request_id != second.request_id
+    assert first.payload_checksum == second.payload_checksum
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +347,7 @@ def test_fetch_response_by_id_reconstructs_response() -> None:
     """A persisted row reconstructs the complete Response object."""
 
     expected = _response(
-        status=ResponseStatus.PARTIAL,
-        sequence=3,
+        status=ResponseStatus.ERROR,
         payload_checksum=_checksum(b"response bytes"),
         size_bytes=len(b"response bytes"),
         media_type="application/json",
@@ -326,7 +356,7 @@ def test_fetch_response_by_id_reconstructs_response() -> None:
         adapter_meta={
             "vendor_request_id": "abc-123",
             "transport": {
-                "status": 200,
+                "status": 503,
             },
         },
     )
@@ -350,6 +380,74 @@ def test_fetch_response_by_id_reconstructs_response() -> None:
     assert response == expected
 
 
+def test_fetch_response_by_id_converts_database_timestamps_to_mxm_timestamps() -> None:
+    """Psycopg datetime values reconstruct as canonical MXM timestamps."""
+
+    expected = _response()
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    _response_row(expected),
+                ]
+            ),
+        ]
+    )
+
+    response = fetch_response_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        response_id=expected.id,
+    )
+
+    assert response is not None
+    assert response.created_at == expected.created_at
+    assert response.fetched_at == expected.fetched_at
+
+
+def test_fetch_response_by_id_normalises_aware_database_timestamp_to_utc() -> None:
+    """Equivalent database timezone representations reconstruct to one instant."""
+
+    expected = _response(
+        created_at=ts_ns_from_str("2026-09-03T08:00:00.000000000Z"),
+    )
+
+    row = _response_row(expected)
+
+    utc_plus_one = timezone(
+        timedelta(hours=1),
+    )
+
+    row = _row_with_value(
+        row,
+        3,
+        datetime(
+            2026,
+            9,
+            3,
+            9,
+            0,
+            tzinfo=utc_plus_one,
+        ),
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(rows=[row]),
+        ]
+    )
+
+    response = fetch_response_by_id(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        response_id=expected.id,
+    )
+
+    assert response is not None
+    assert response.created_at == expected.created_at
+
+
 def test_fetch_response_by_id_uses_configured_schema_and_identity() -> None:
     """Response lookup uses the configured schema and observation ID."""
 
@@ -368,8 +466,8 @@ def test_fetch_response_by_id_uses_configured_schema_and_identity() -> None:
     execution = _single_execution(connection)
     query_text = _query_text(execution.query)
 
-    assert '"dataio_test_abc".responses' in query_text
-    assert '"public".responses' not in query_text
+    assert '"dataio_test_abc"."responses"' in query_text
+    assert '"public"."responses"' not in query_text
     assert "WHERE id = %s" in query_text
     assert execution.parameters == ("response-1",)
 
@@ -465,22 +563,6 @@ _RESPONSE_ROW = _response_row(_response())
             _row_with_value(
                 _RESPONSE_ROW,
                 3,
-                -1,
-            ),
-            r"sequence must be a non-negative integer",
-        ),
-        (
-            _row_with_value(
-                _RESPONSE_ROW,
-                3,
-                True,
-            ),
-            r"sequence must be a non-negative integer",
-        ),
-        (
-            _row_with_value(
-                _RESPONSE_ROW,
-                4,
                 "2026-09-03T08:00:00Z",
             ),
             r"created_at must be a datetime",
@@ -488,7 +570,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                4,
+                3,
                 datetime(
                     2026,
                     9,
@@ -502,7 +584,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                5,
+                4,
                 "2026-09-03T08:00:01Z",
             ),
             r"fetched_at must be a datetime",
@@ -510,7 +592,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                5,
+                4,
                 datetime(
                     2026,
                     9,
@@ -525,7 +607,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                6,
+                5,
                 "not-a-hash",
             ),
             r"64-character lowercase hexadecimal",
@@ -533,7 +615,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                7,
+                6,
                 -1,
             ),
             r"size_bytes must be a non-negative integer",
@@ -541,7 +623,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                7,
+                6,
                 True,
             ),
             r"size_bytes must be a non-negative integer",
@@ -549,7 +631,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                8,
+                7,
                 123,
             ),
             r"media_type must be text or NULL",
@@ -557,7 +639,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                9,
+                8,
                 123,
             ),
             r"encoding must be text or NULL",
@@ -565,7 +647,7 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                10,
+                9,
                 -1,
             ),
             r"elapsed_ms must be a non-negative integer",
@@ -573,15 +655,23 @@ _RESPONSE_ROW = _response_row(_response())
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                11,
-                ["not-an-object"],
+                9,
+                True,
             ),
-            r"adapter_meta must be a JSON object or NULL",
+            r"elapsed_ms must be a non-negative integer",
         ),
         (
             _row_with_value(
                 _RESPONSE_ROW,
-                11,
+                10,
+                ["not-an-object"],
+            ),
+            r"adapter_meta must be a JSON object",
+        ),
+        (
+            _row_with_value(
+                _RESPONSE_ROW,
+                10,
                 {
                     "bad": object(),
                 },
@@ -594,7 +684,7 @@ def test_fetch_response_by_id_rejects_invalid_rows(
     row: PostgresRow,
     error_match: str,
 ) -> None:
-    """Malformed persisted response rows cannot enter the domain."""
+    """Malformed persisted Response rows cannot enter the model."""
 
     connection = FakeConnection(
         [
@@ -619,7 +709,7 @@ def test_fetch_response_by_id_rejects_invalid_rows(
 
 
 def test_fetch_responses_by_request_id_returns_empty_mapping() -> None:
-    """A request with no acquired observations produces an empty mapping."""
+    """A Request with no acquired observations produces an empty mapping."""
 
     connection = FakeConnection(
         [
@@ -637,34 +727,18 @@ def test_fetch_responses_by_request_id_returns_empty_mapping() -> None:
 
 
 def test_fetch_responses_by_request_id_preserves_distinct_observations() -> None:
-    """Multiple observations acquired by one request remain independent."""
+    """Multiple Responses acquired by one Request remain independent."""
 
     first = _response(
         response_id="response-1",
         request_id="request-1",
-        sequence=0,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            8,
-            0,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T08:00:00.000000000Z"),
     )
 
     second = _response(
         response_id="response-2",
         request_id="request-1",
-        sequence=1,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            8,
-            1,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T08:01:00.000000000Z"),
         payload_checksum=_checksum(b"second payload"),
         size_bytes=len(b"second payload"),
     )
@@ -693,7 +767,7 @@ def test_fetch_responses_by_request_id_preserves_distinct_observations() -> None
 
 
 def test_fetch_responses_by_request_id_uses_filter_and_deterministic_ordering() -> None:
-    """Request lookup filters by Q and orders observations deterministically."""
+    """Request lookup filters by acquiring Q and orders observations."""
 
     connection = FakeConnection(
         [
@@ -710,14 +784,14 @@ def test_fetch_responses_by_request_id_uses_filter_and_deterministic_ordering() 
     execution = _single_execution(connection)
     query_text = _query_text(execution.query)
 
-    assert '"dataio_test_abc".responses' in query_text
+    assert '"dataio_test_abc"."responses"' in query_text
     assert "WHERE request_id = %s" in query_text
     assert "ORDER BY created_at, id" in query_text
     assert execution.parameters == ("request-1",)
 
 
 def test_fetch_responses_by_request_id_rejects_invalid_identifier_before_sql() -> None:
-    """Invalid request occurrence identity fails before database access."""
+    """Invalid Request occurrence identity fails before database access."""
 
     connection = FakeConnection()
 
@@ -735,8 +809,8 @@ def test_fetch_responses_by_request_id_rejects_invalid_identifier_before_sql() -
     assert connection.executions == []
 
 
-def test_fetch_responses_by_request_id_rejects_duplicate_observation_identity() -> None:
-    """One result set cannot contain the same response observation twice."""
+def test_fetch_responses_by_request_id_rejects_duplicate_response_identity() -> None:
+    """One result set cannot contain the same Response twice."""
 
     response = _response()
 
@@ -753,7 +827,7 @@ def test_fetch_responses_by_request_id_rejects_duplicate_observation_identity() 
 
     with pytest.raises(
         ResponsePersistenceError,
-        match=r"duplicate observation identity.*response-1",
+        match=r"duplicate Response ID.*response-1",
     ):
         fetch_responses_by_request_id(
             _as_connection(connection),
@@ -786,7 +860,7 @@ def test_fetch_responses_by_payload_checksum_returns_empty_mapping() -> None:
 
 
 def test_fetch_responses_by_payload_checksum_preserves_distinct_observations() -> None:
-    """One exact payload may be referenced by distinct external observations."""
+    """One exact payload may be referenced by distinct Response observations."""
 
     payload_checksum = _checksum(b"same bytes")
 
@@ -803,9 +877,6 @@ def test_fetch_responses_by_payload_checksum_preserves_distinct_observations() -
         payload_checksum=payload_checksum,
         size_bytes=len(b"same bytes"),
     )
-
-    assert first.id != second.id
-    assert first.payload_checksum == second.payload_checksum
 
     connection = FakeConnection(
         [
@@ -850,7 +921,7 @@ def test_fetch_responses_by_payload_checksum_uses_filter_and_ordering() -> None:
     execution = _single_execution(connection)
     query_text = _query_text(execution.query)
 
-    assert '"dataio_test_abc".responses' in query_text
+    assert '"dataio_test_abc"."responses"' in query_text
     assert "WHERE payload_checksum = %s" in query_text
     assert "ORDER BY created_at, id" in query_text
     assert execution.parameters == (payload_checksum,)
@@ -875,8 +946,8 @@ def test_fetch_responses_by_payload_checksum_rejects_invalid_hash_before_sql() -
     assert connection.executions == []
 
 
-def test_fetch_responses_by_payload_checksum_rejects_duplicate_observation() -> None:
-    """Payload lookup cannot contain the same observation twice."""
+def test_fetch_responses_by_payload_checksum_rejects_duplicate_response() -> None:
+    """Payload lookup cannot contain the same Response twice."""
 
     response = _response()
 
@@ -893,7 +964,7 @@ def test_fetch_responses_by_payload_checksum_rejects_duplicate_observation() -> 
 
     with pytest.raises(
         ResponsePersistenceError,
-        match=r"duplicate response observation.*response-1",
+        match=r"duplicate Response ID.*response-1",
     ):
         fetch_responses_by_payload_checksum(
             _as_connection(connection),
@@ -911,8 +982,7 @@ def test_insert_response_encodes_complete_observation_state() -> None:
     """One Response is encoded into the expected SQL representation."""
 
     response = _response(
-        status=ResponseStatus.PARTIAL,
-        sequence=4,
+        status=ResponseStatus.ERROR,
         payload_checksum=_checksum(b"response bytes"),
         size_bytes=len(b"response bytes"),
         media_type="application/json",
@@ -920,8 +990,8 @@ def test_insert_response_encodes_complete_observation_state() -> None:
         elapsed_ms=247,
         adapter_meta={
             "source_request_id": "source-123",
-            "measurement": {
-                "quality": "good",
+            "transport": {
+                "status": 500,
             },
         },
     )
@@ -946,27 +1016,26 @@ def test_insert_response_encodes_complete_observation_state() -> None:
     execution = connection.executions[0]
     query_text = _query_text(execution.query)
 
-    assert '"dataio_test_abc".responses' in query_text
-    assert '"public".responses' not in query_text
+    assert '"dataio_test_abc"."responses"' in query_text
+    assert '"public"."responses"' not in query_text
     assert "ON CONFLICT (id) DO NOTHING" in query_text
 
     parameters = _execution_parameters(execution)
 
-    assert len(parameters) == 12
+    assert len(parameters) == 11
 
     assert parameters[0] == response.id
     assert parameters[1] == response.request_id
     assert parameters[2] == response.status.value
-    assert parameters[3] == response.sequence
-    assert parameters[4] == response.created_at
-    assert parameters[5] == response.fetched_at
-    assert parameters[6] == response.payload_checksum
-    assert parameters[7] == response.size_bytes
-    assert parameters[8] == response.media_type
-    assert parameters[9] == response.encoding
-    assert parameters[10] == response.elapsed_ms
+    assert parameters[3] == _db_datetime(response.created_at)
+    assert parameters[4] == _db_datetime(response.fetched_at)
+    assert parameters[5] == response.payload_checksum
+    assert parameters[6] == response.size_bytes
+    assert parameters[7] == response.media_type
+    assert parameters[8] == response.encoding
+    assert parameters[9] == response.elapsed_ms
 
-    adapter_meta_json = parameters[11]
+    adapter_meta_json = parameters[10]
 
     assert isinstance(
         adapter_meta_json,
@@ -1001,7 +1070,7 @@ def test_insert_response_encodes_absent_adapter_meta_as_null() -> None:
 
     parameters = _execution_parameters(connection.executions[0])
 
-    assert parameters[11] is None
+    assert parameters[10] is None
 
 
 def test_insert_response_conflicts_on_observation_identity_not_payload_identity() -> (
@@ -1069,7 +1138,7 @@ def test_insert_response_accepts_matching_persisted_state() -> None:
 
 
 def test_insert_response_rejects_conflicting_persisted_observation() -> None:
-    """One response ID cannot identify two different external observations."""
+    """One Response ID cannot identify two different external observations."""
 
     requested = _response(
         response_id="response-1",
@@ -1096,7 +1165,7 @@ def test_insert_response_rejects_conflicting_persisted_observation() -> None:
 
     with pytest.raises(
         ResponseConflictError,
-        match=r"Persisted response conflicts.*response-1",
+        match=r"Persisted Response conflicts.*response-1",
     ):
         insert_response(
             _as_connection(connection),
@@ -1153,36 +1222,6 @@ def test_insert_response_rejects_missing_state_after_insert() -> None:
         ),
         (
             _response(
-                sequence=-1,
-            ),
-            r"sequence must be a non-negative integer",
-        ),
-        (
-            _response(
-                created_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    8,
-                    0,
-                ),
-            ),
-            r"created_at must be timezone-aware",
-        ),
-        (
-            _response(
-                fetched_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    8,
-                    0,
-                ),
-            ),
-            r"fetched_at must be timezone-aware",
-        ),
-        (
-            _response(
                 payload_checksum="not-a-hash",
             ),
             r"64-character lowercase hexadecimal",
@@ -1223,6 +1262,102 @@ def test_insert_response_rejects_invalid_state_before_sql(
     assert connection.executions == []
 
 
+def test_insert_response_rejects_noncanonical_created_at_before_sql() -> None:
+    """Response timestamps must use the canonical MXM representation."""
+
+    invalid_timestamp = cast(
+        TSNSScalar,
+        "2026-09-03T08:00:00Z",
+    )
+
+    response = _response(
+        created_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResponsePersistenceError,
+        match=r"created_at must be a valid canonical MXM timestamp",
+    ):
+        insert_response(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            response=response,
+        )
+
+    assert connection.cursor_calls == 0
+
+
+def test_insert_response_rejects_noncanonical_fetched_at_before_sql() -> None:
+    """Both Response timestamps independently cross the SQL timestamp boundary."""
+
+    invalid_timestamp = cast(
+        TSNSScalar,
+        "2026-09-03T08:00:01Z",
+    )
+
+    response = _response(
+        fetched_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResponsePersistenceError,
+        match=r"fetched_at must be a valid canonical MXM timestamp",
+    ):
+        insert_response(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            response=response,
+        )
+
+    assert connection.cursor_calls == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "created_at",
+        "fetched_at",
+    ],
+)
+def test_insert_response_rejects_non_microsecond_aligned_timestamp(
+    field: str,
+) -> None:
+    """Persistence never silently truncates Response nanosecond timestamps."""
+
+    base = _CREATED_AT if field == "created_at" else _FETCHED_AT
+
+    invalid_timestamp = ts_ns_from_int(
+        ts_ns_to_int(base) + 1,
+    )
+
+    if field == "created_at":
+        response = _response(
+            created_at=invalid_timestamp,
+        )
+    else:
+        response = _response(
+            fetched_at=invalid_timestamp,
+        )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResponsePersistenceError,
+        match=rf"{field} cannot be represented exactly.*microsecond precision",
+    ):
+        insert_response(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            response=response,
+        )
+
+    assert connection.cursor_calls == 0
+
+
 def test_insert_response_rejects_nested_non_json_adapter_meta_before_sql() -> None:
     """Invalid nested adapter metadata cannot cross the persistence boundary."""
 
@@ -1248,6 +1383,31 @@ def test_insert_response_rejects_nested_non_json_adapter_meta_before_sql() -> No
     with pytest.raises(
         ResponsePersistenceError,
         match=r"adapter_meta\.bad must contain JSON-compatible values",
+    ):
+        insert_response(
+            _as_connection(connection),
+            schema="dataio_test_abc",
+            response=response,
+        )
+
+    assert connection.cursor_calls == 0
+    assert connection.executions == []
+
+
+def test_insert_response_rejects_non_finite_adapter_meta_float_before_sql() -> None:
+    """Adapter metadata must remain representable by the DataIO JSON model."""
+
+    response = _response(
+        adapter_meta={
+            "latency_ratio": float("nan"),
+        }
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResponsePersistenceError,
+        match=r"adapter_meta\.latency_ratio must contain JSON-compatible values",
     ):
         insert_response(
             _as_connection(connection),

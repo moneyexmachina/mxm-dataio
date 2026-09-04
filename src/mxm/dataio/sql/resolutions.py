@@ -1,4 +1,4 @@
-"""Plain-SQL persistence operations for DataIO request resolutions.
+"""Plain-SQL persistence operations for DataIO Request resolutions.
 
 This module owns the PostgreSQL representation of ``Resolution`` objects.
 
@@ -19,6 +19,11 @@ This module validates that structural relationship between Resolution and
 Response. It does not determine whether reuse was permitted by Session cache
 policy, TTL, source, as-of bucket, cache tag, or other runtime decision inputs.
 
+Model timestamps use the canonical MXM ``TSNSScalar`` representation.
+PostgreSQL stores timestamps as ``timestamptz``. The representation bridge
+between those forms lives in ``sql_timestamps``; this module translates
+timestamp-boundary failures into Resolution persistence errors.
+
 All functions operate on a caller-provided Psycopg connection. They do not
 open, commit, or roll back transactions. Transaction ownership belongs to the
 higher-level DataIO operation.
@@ -33,16 +38,23 @@ from psycopg import Connection, sql
 
 from mxm.dataio.models import Resolution, ResolutionKind
 from mxm.dataio.sql.postgres import PostgresRow
+from mxm.dataio.sql.sql_timestamps import (
+    SqlTimestampError,
+    require_db_timestamp,
+    ts_ns_to_db_datetime,
+    validate_sql_timestamp,
+)
+from mxm.types.timestamps import TSNSScalar
 
 type ExecutableQuery = sql.SQL | sql.Composed
 
 
 class ResolutionPersistenceError(RuntimeError):
-    """Base error for invalid or inconsistent persisted resolution state."""
+    """Base error for invalid or inconsistent persisted Resolution state."""
 
 
 class ResolutionConflictError(ResolutionPersistenceError):
-    """Raised when one Request occurrence identifies different resolutions."""
+    """Raised when one Request occurrence identifies different Resolutions."""
 
 
 # ---------------------------------------------------------------------
@@ -111,7 +123,7 @@ def fetch_resolutions_by_response_id(
     The returned mapping is keyed by Request occurrence ID.
 
     Multiple Resolutions may legitimately reference one Response. This is the
-    relational representation of observation reuse.
+    relational representation of Response reuse.
 
     Results are deterministically ordered by resolution time and then Request
     ID before being reconstructed into the mapping.
@@ -232,7 +244,10 @@ def insert_resolution(
                 resolution.request_id,
                 resolution.response_id,
                 resolution.kind.value,
-                resolution.resolved_at,
+                _ts_ns_to_db_datetime(
+                    resolution.resolved_at,
+                    field="resolved_at",
+                ),
             ),
         )
 
@@ -250,7 +265,7 @@ def insert_resolution(
 
     if persisted_resolution != resolution:
         raise ResolutionConflictError(
-            "Persisted resolution conflicts with requested resolution for "
+            "Persisted Resolution conflicts with requested Resolution for "
             f"request_id {resolution.request_id!r}: "
             f"persisted={persisted_resolution!r}, "
             f"requested={resolution!r}"
@@ -355,7 +370,7 @@ def _resolutions_from_rows(
 def _resolution_from_row(
     row: PostgresRow,
 ) -> Resolution:
-    """Reconstruct one validated Resolution from a database row."""
+    """Reconstruct one validated Resolution from a PostgreSQL row."""
 
     if len(row) != 4:
         raise ResolutionPersistenceError(
@@ -377,7 +392,7 @@ def _resolution_from_row(
         field="kind",
     )
 
-    resolved_at = _require_datetime(
+    resolved_at = _require_db_timestamp(
         row[3],
         field="resolved_at",
     )
@@ -388,7 +403,7 @@ def _resolution_from_row(
         )
     except ValueError as err:
         raise ResolutionPersistenceError(
-            f"Persisted resolution kind is not recognised: {kind_text!r}"
+            f"Persisted Resolution kind is not recognised: {kind_text!r}"
         ) from err
 
     resolution = Resolution(
@@ -416,7 +431,7 @@ def _validate_resolution_response_relationship(
     schema: str,
     resolution: Resolution,
 ) -> None:
-    """Validate Resolution kind against the Response acquisition relationship."""
+    """Validate Resolution kind against Response acquisition provenance."""
 
     acquiring_request_id = _fetch_response_request_id(
         connection,
@@ -453,11 +468,62 @@ def _validate_resolution_response_relationship(
 
         return
 
-    # Defensive exhaustiveness. ``_validate_resolution`` and the enum type
-    # should make this unreachable.
     raise ResolutionPersistenceError(
         f"Unsupported Resolution kind: {resolution.kind!r}"
     )
+
+
+# ---------------------------------------------------------------------
+# TIMESTAMP BOUNDARY ERROR TRANSLATION
+# ---------------------------------------------------------------------
+
+
+def _validate_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Validate one Resolution timestamp for PostgreSQL persistence."""
+
+    try:
+        return validate_sql_timestamp(
+            value,
+            field=f"Resolution {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResolutionPersistenceError(str(err)) from err
+
+
+def _ts_ns_to_db_datetime(
+    value: TSNSScalar,
+    *,
+    field: str,
+) -> datetime:
+    """Convert one Resolution timestamp to the Psycopg representation."""
+
+    try:
+        return ts_ns_to_db_datetime(
+            value,
+            field=f"Resolution {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResolutionPersistenceError(str(err)) from err
+
+
+def _require_db_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Convert one required persisted Resolution timestamp."""
+
+    try:
+        return require_db_timestamp(
+            value,
+            field=f"Persisted Resolution {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResolutionPersistenceError(str(err)) from err
 
 
 # ---------------------------------------------------------------------
@@ -480,7 +546,7 @@ def _validate_resolution(
         field="response_id",
     )
 
-    _validate_datetime(
+    _validate_timestamp(
         resolution.resolved_at,
         field="resolved_at",
     )
@@ -493,13 +559,7 @@ def _validate_identifier(
 ) -> None:
     """Require a non-empty text identifier."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
+    if not isinstance(value, str) or not value:
         raise ResolutionPersistenceError(
             f"Resolution {field} must be non-empty text, got {value!r}"
         )
@@ -512,15 +572,9 @@ def _require_text(
 ) -> str:
     """Require a non-empty persisted text value."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
+    if not isinstance(value, str) or not value:
         raise ResolutionPersistenceError(
-            f"Persisted resolution {field} must be non-empty text, got {value!r}"
+            f"Persisted Resolution {field} must be non-empty text, got {value!r}"
         )
 
     return value
@@ -531,61 +585,9 @@ def _require_response_request_id(
 ) -> str:
     """Require the persisted acquiring Request identity of a Response."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
+    if not isinstance(value, str) or not value:
         raise ResolutionPersistenceError(
             f"Persisted Response request_id must be non-empty text, got {value!r}"
-        )
-
-    return value
-
-
-def _validate_datetime(
-    value: object,
-    *,
-    field: str,
-) -> datetime:
-    """Require a timezone-aware datetime."""
-
-    if not isinstance(
-        value,
-        datetime,
-    ):
-        raise ResolutionPersistenceError(
-            f"Resolution {field} must be a datetime, got {value!r}"
-        )
-
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ResolutionPersistenceError(
-            f"Resolution {field} must be timezone-aware, got {value!r}"
-        )
-
-    return value
-
-
-def _require_datetime(
-    value: object,
-    *,
-    field: str,
-) -> datetime:
-    """Require a timezone-aware persisted datetime."""
-
-    if not isinstance(
-        value,
-        datetime,
-    ):
-        raise ResolutionPersistenceError(
-            f"Persisted resolution {field} must be a datetime, got {value!r}"
-        )
-
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ResolutionPersistenceError(
-            f"Persisted resolution {field} must be timezone-aware, got {value!r}"
         )
 
     return value

@@ -1,473 +1,318 @@
+"""Executable architectural invariants for DataIO V1.
+
+This suite records cross-model properties of the current V1 architecture that
+are already stable independently of the unfinished DataIO runtime.
+
+It deliberately does not exercise the legacy API, SQLite Store, adapter
+registry, cache implementation, or runtime resolution machinery.
+
+Repository behaviour, PostgreSQL constraints, timestamp representation, and
+object-store behaviour are tested in their dedicated suites.
+
+As the V1 runtime is rebuilt, this suite should grow to cover the remaining
+cross-component invariants: reuse partitioning, TTL, cache modes, candidate
+selection, Resolution creation, payload retrieval, and acquisition behaviour.
+"""
+
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-from typing import cast
+from mxm.dataio.models import (
+    CacheMode,
+    Request,
+    Resolution,
+    ResolutionKind,
+    Response,
+    ResponseStatus,
+    Session,
+)
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_str,
+)
 
-import pytest
-
-import mxm.dataio.api as api_mod
-from mxm.config import MXMConfig
-from mxm.dataio.adapters import Fetcher
-from mxm.dataio.api import CacheMode, DataIoSession
-from mxm.dataio.models import AdapterResult, Request
-from mxm.dataio.store import Store
-
-
-class _Paths:
-    def __init__(self, root: Path) -> None:
-        self.root = str(root)
-        self.db_path = str(root / "dataio.sqlite")
-        self.responses_dir = str(root / "responses")
+# ---------------------------------------------------------------------------
+# Timestamp fixtures
+# ---------------------------------------------------------------------------
 
 
-class _Config:
-    def __init__(self, root: Path) -> None:
-        self.paths = _Paths(root)
+def _ts(
+    value: str,
+) -> TSNSScalar:
+    """Construct one deterministic canonical MXM timestamp."""
+
+    return ts_ns_from_str(value)
 
 
-class CountingFetcher(Fetcher):
-    """Fetcher whose payload changes on every real external observation."""
-
-    source = "source-a"
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def fetch(self, request: Request) -> AdapterResult:
-        _ = request
-        self.calls += 1
-        return AdapterResult(
-            data=f"observation-{self.calls}".encode(),
-            headers={"X-Request-ID": str(self.calls)},
-        )
-
-    def describe(self) -> str:
-        return "Counting fetcher"
-
-    def close(self) -> None:
-        pass
+# ---------------------------------------------------------------------------
+# Logical-question identity
+# ---------------------------------------------------------------------------
 
 
-class IdenticalPayloadFetcher(Fetcher):
-    """Fetcher returning identical bytes but observation-specific metadata."""
+def test_equivalent_questions_share_hash_across_request_occurrences() -> None:
+    """H identifies the logical question, not the Request occurrence."""
 
-    source = "source-a"
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def fetch(self, request: Request) -> AdapterResult:
-        _ = request
-        self.calls += 1
-        return AdapterResult(
-            data=b"identical-payload",
-            headers={"X-Request-ID": str(self.calls)},
-        )
-
-    def describe(self) -> str:
-        return "Identical-payload fetcher"
-
-    def close(self) -> None:
-        pass
-
-
-@pytest.fixture()
-def cfg(tmp_path: Path) -> MXMConfig:
-    root = tmp_path / "dataio"
-    root.mkdir()
-    return cast(MXMConfig, _Config(root))
-
-
-@pytest.fixture()
-def store(cfg: MXMConfig) -> Store:
-    return Store(cfg)
-
-
-def _patch_fetcher(
-    monkeypatch: pytest.MonkeyPatch,
-    fetcher: Fetcher,
-) -> None:
-    def resolve_adapter(_: str) -> Fetcher:
-        return fetcher
-
-    monkeypatch.setattr(
-        api_mod,
-        "resolve_adapter",
-        resolve_adapter,
-        raising=True,
+    first = Request(
+        id="request-1",
+        session_id="session-1",
+        kind="databento.timeseries.get_range",
+        params={
+            "dataset": "GLBX.MDP3",
+            "symbols": ["ES.c.0"],
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
     )
 
+    second = Request(
+        id="request-2",
+        session_id="session-2",
+        kind="databento.timeseries.get_range",
+        params={
+            "dataset": "GLBX.MDP3",
+            "symbols": ["ES.c.0"],
+        },
+        created_at=_ts("2026-09-03T11:00:00.000000000Z"),
+    )
 
-def _persisted_request_ids(store: Store) -> set[str]:
-    with store.connect() as conn:
-        rows = conn.execute("SELECT id FROM requests").fetchall()
-    return {cast(str, row[0]) for row in rows}
+    assert first.id != second.id
+    assert first.session_id != second.session_id
+    assert first.created_at != second.created_at
 
-
-def _persisted_response_rows(
-    store: Store,
-) -> list[tuple[str, str, str | None]]:
-    with store.connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, request_id, checksum
-            FROM responses
-            ORDER BY created_at
-            """
-        ).fetchall()
-
-    return [
-        (
-            cast(str, row[0]),
-            cast(str, row[1]),
-            cast(str | None, row[2]),
-        )
-        for row in rows
-    ]
+    assert first.hash == second.hash
 
 
-# ---------------------------------------------------------------------------
-# Logical request identity
-# ---------------------------------------------------------------------------
+def test_session_context_does_not_participate_in_question_hash() -> None:
+    """Source and cache context partition reuse, not logical-question identity."""
 
-
-def test_equivalent_requests_have_same_logical_hash_but_distinct_ids(
-    cfg: MXMConfig,
-) -> None:
-    with DataIoSession("source-a", cfg) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        q2 = io.request(kind="http", params={"u": "A"})
-
-    assert q1.hash == q2.hash
-    assert q1.id != q2.id
-
-
-def test_logical_hash_ignores_cache_mode_and_ttl(
-    cfg: MXMConfig,
-) -> None:
-    with DataIoSession(
-        "source-a",
-        cfg,
+    first_session = Session(
+        id="session-1",
+        source="source-a",
         cache_mode=CacheMode.DEFAULT,
-        ttl=1.0,
-        as_of_bucket="bucket",
-        cache_tag="tag",
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
+        ttl_seconds=60.0,
+        as_of_bucket="bucket-a",
+        cache_tag="vendor-v1",
+        started_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
 
-    with DataIoSession(
-        "source-a",
-        cfg,
+    second_session = Session(
+        id="session-2",
+        source="source-b",
         cache_mode=CacheMode.ONLY_IF_CACHED,
-        ttl=999.0,
-        as_of_bucket="bucket",
-        cache_tag="tag",
-    ) as io:
-        q2 = io.request(kind="http", params={"u": "A"})
+        ttl_seconds=3_600.0,
+        as_of_bucket="bucket-b",
+        cache_tag="vendor-v2",
+        started_at=_ts("2026-09-03T11:00:00.000000000Z"),
+    )
 
-    assert q1.hash == q2.hash
+    first = Request(
+        id="request-1",
+        session_id=first_session.id,
+        kind="prices",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:01:00.000000000Z"),
+    )
 
+    second = Request(
+        id="request-2",
+        session_id=second_session.id,
+        kind="prices",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T11:01:00.000000000Z"),
+    )
 
-def test_as_of_bucket_partitions_logical_identity(
-    cfg: MXMConfig,
-) -> None:
-    with DataIoSession("source-a", cfg, as_of_bucket="A") as io:
-        q1 = io.request(kind="http", params={"u": "A"})
+    assert first_session.source != second_session.source
+    assert first_session.cache_mode != second_session.cache_mode
+    assert first_session.ttl_seconds != second_session.ttl_seconds
+    assert first_session.as_of_bucket != second_session.as_of_bucket
+    assert first_session.cache_tag != second_session.cache_tag
 
-    with DataIoSession("source-a", cfg, as_of_bucket="B") as io:
-        q2 = io.request(kind="http", params={"u": "A"})
-
-    assert q1.hash != q2.hash
-
-
-def test_cache_tag_partitions_logical_identity(
-    cfg: MXMConfig,
-) -> None:
-    with DataIoSession("source-a", cfg, cache_tag="en") as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-
-    with DataIoSession("source-a", cfg, cache_tag="de") as io:
-        q2 = io.request(kind="http", params={"u": "A"})
-
-    assert q1.hash != q2.hash
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="ED005: source is not yet part of logical request identity",
-)
-def test_source_partitions_logical_identity(
-    cfg: MXMConfig,
-) -> None:
-    with DataIoSession("source-a", cfg) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-
-    with DataIoSession("source-b", cfg) as io:
-        q2 = io.request(kind="http", params={"u": "A"})
-
-    assert q1.hash != q2.hash
+    assert first.hash == second.hash
 
 
-# ---------------------------------------------------------------------------
-# Request occurrence persistence
-# ---------------------------------------------------------------------------
+def test_question_bearing_fields_define_request_hash() -> None:
+    """Changing kind or params changes logical-question identity."""
+
+    baseline = Request(
+        id="request-1",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
+
+    different_kind = Request(
+        id="request-2",
+        session_id="session-1",
+        kind="settlements",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
+
+    different_params = Request(
+        id="request-3",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "symbol": "NQ",
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
+
+    assert baseline.hash != different_kind.hash
+    assert baseline.hash != different_params.hash
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ED005: UNIQUE(request.hash) plus INSERT OR IGNORE currently collapses "
-        "equivalent request occurrences"
-    ),
-)
-def test_equivalent_request_occurrences_are_both_persisted(
-    cfg: MXMConfig,
-    store: Store,
-) -> None:
-    with DataIoSession("source-a", cfg, store=store) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        q2 = io.request(kind="http", params={"u": "A"})
+def test_question_hash_is_independent_of_parameter_key_order() -> None:
+    """Equivalent JSON objects represent the same logical question."""
 
-    assert q1.hash == q2.hash
-    assert q1.id != q2.id
+    first = Request(
+        id="request-1",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "symbol": "ES",
+            "schema": "ohlcv-1h",
+            "limit": 100,
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
 
-    persisted = _persisted_request_ids(store)
+    second = Request(
+        id="request-2",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "limit": 100,
+            "schema": "ohlcv-1h",
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:01:00.000000000Z"),
+    )
 
-    assert q1.id in persisted
-    assert q2.id in persisted
-
-
-# ---------------------------------------------------------------------------
-# Observation semantics
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ED005: repeated equivalent request occurrences are currently collapsed, "
-        "so the second BYPASS response can reference a non-persisted request"
-    ),
-)
-def test_bypass_creates_two_valid_request_observation_chains(
-    cfg: MXMConfig,
-    store: Store,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fetcher = CountingFetcher()
-    _patch_fetcher(monkeypatch, fetcher)
-
-    with DataIoSession(
-        "source-a",
-        cfg,
-        store=store,
-        cache_mode=CacheMode.BYPASS,
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        r1 = io.fetch(q1)
-
-        q2 = io.request(kind="http", params={"u": "A"})
-        r2 = io.fetch(q2)
-
-    assert fetcher.calls == 2
-
-    assert q1.hash == q2.hash
-    assert q1.id != q2.id
-
-    assert r1.id != r2.id
-    assert r1.request_id == q1.id
-    assert r2.request_id == q2.id
-
-    request_ids = _persisted_request_ids(store)
-    assert q1.id in request_ids
-    assert q2.id in request_ids
-
-    response_rows = _persisted_response_rows(store)
-    persisted_links = {
-        (response_id, request_id) for response_id, request_id, _ in response_rows
-    }
-
-    assert (r1.id, q1.id) in persisted_links
-    assert (r2.id, q2.id) in persisted_links
-
-
-def test_default_reuses_existing_observation_without_external_fetch(
-    cfg: MXMConfig,
-    store: Store,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fetcher = CountingFetcher()
-    _patch_fetcher(monkeypatch, fetcher)
-
-    with DataIoSession(
-        "source-a",
-        cfg,
-        store=store,
-        cache_mode=CacheMode.DEFAULT,
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        r1 = io.fetch(q1)
-
-        q2 = io.request(kind="http", params={"u": "A"})
-        r2 = io.fetch(q2)
-
-    assert q1.hash == q2.hash
-    assert q1.id != q2.id
-    assert fetcher.calls == 1
-
-    # Current API already returns the original durable response on archive reuse.
-    assert r2.id == r1.id
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ED005: cache-hit request occurrence is currently collapsed by "
-        "UNIQUE(request.hash)"
-    ),
-)
-def test_default_cache_hit_retains_second_request_occurrence(
-    cfg: MXMConfig,
-    store: Store,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fetcher = CountingFetcher()
-    _patch_fetcher(monkeypatch, fetcher)
-
-    with DataIoSession(
-        "source-a",
-        cfg,
-        store=store,
-        cache_mode=CacheMode.DEFAULT,
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        r1 = io.fetch(q1)
-
-        q2 = io.request(kind="http", params={"u": "A"})
-        r2 = io.fetch(q2)
-
-    assert fetcher.calls == 1
-    assert r2.id == r1.id
-
-    request_ids = _persisted_request_ids(store)
-    assert q1.id in request_ids
-    assert q2.id in request_ids
+    assert first.hash == second.hash
 
 
 # ---------------------------------------------------------------------------
-# Payload identity versus observation identity
+# Request occurrence versus logical identity
 # ---------------------------------------------------------------------------
 
 
-def test_identical_external_payloads_have_same_checksum_but_distinct_responses(
-    cfg: MXMConfig,
-    store: Store,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fetcher = IdenticalPayloadFetcher()
-    _patch_fetcher(monkeypatch, fetcher)
+def test_equivalent_questions_remain_distinct_request_occurrences() -> None:
+    """Q identity remains distinct even when logical-question identity is equal."""
 
-    with DataIoSession(
-        "source-a",
-        cfg,
-        store=store,
-        cache_mode=CacheMode.BYPASS,
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        r1 = io.fetch(q1)
+    first = Request(
+        id="request-1",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
+    )
 
-        q2 = io.request(kind="http", params={"u": "A"})
-        r2 = io.fetch(q2)
+    second = Request(
+        id="request-2",
+        session_id="session-1",
+        kind="prices",
+        params={
+            "symbol": "ES",
+        },
+        created_at=_ts("2026-09-03T10:01:00.000000000Z"),
+    )
 
-    assert fetcher.calls == 2
-    assert r1.id != r2.id
-    assert r1.checksum == r2.checksum
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "ED005: response-specific metadata is currently keyed by payload "
-        "checksum in a first-write-wins filesystem sidecar"
-    ),
-)
-def test_identical_payload_observations_retain_independent_metadata(
-    cfg: MXMConfig,
-    store: Store,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fetcher = IdenticalPayloadFetcher()
-    _patch_fetcher(monkeypatch, fetcher)
-
-    with DataIoSession(
-        "source-a",
-        cfg,
-        store=store,
-        cache_mode=CacheMode.BYPASS,
-    ) as io:
-        q1 = io.request(kind="http", params={"u": "A"})
-        r1 = io.fetch(q1)
-
-        q2 = io.request(kind="http", params={"u": "A"})
-        r2 = io.fetch(q2)
-
-    assert r1.id != r2.id
-    assert r1.checksum == r2.checksum
-
-    # Target invariant:
-    #
-    # observation_metadata(r1)["headers"]["X-Request-ID"] == "1"
-    # observation_metadata(r2)["headers"]["X-Request-ID"] == "2"
-    #
-    # The current Store cannot express this: metadata is addressed only
-    # by payload checksum. This explicit failure prevents us from silently
-    # preserving the sidecar model.
-    assert r1.checksum is not None
-    first_metadata = store.read_metadata(r1.checksum)
-    second_metadata = store.read_metadata(r2.checksum)
-
-    assert first_metadata["headers"] == {"X-Request-ID": "1"}
-    assert second_metadata["headers"] == {"X-Request-ID": "2"}
+    assert first.hash == second.hash
+    assert first.id != second.id
 
 
 # ---------------------------------------------------------------------------
-# Foreign-key integrity regression
+# Response identity versus Payload identity
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ED005: SQLite foreign-key enforcement is not enabled",
-)
-def test_store_enforces_request_response_foreign_key_integrity(
-    store: Store,
-) -> None:
-    with pytest.raises(sqlite3.IntegrityError):
-        with store.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO responses
-                (
-                    id,
-                    request_id,
-                    status,
-                    sequence,
-                    checksum,
-                    path,
-                    created_at,
-                    size_bytes
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "response-with-missing-request",
-                    "request-that-does-not-exist",
-                    "ok",
-                    None,
-                    None,
-                    None,
-                    "2026-09-02T08:00:00+00:00",
-                    None,
-                ),
-            )
+def test_distinct_responses_may_share_exact_payload_identity() -> None:
+    """R identifies an observation occurrence independently of payload P."""
+
+    payload_checksum = "a" * 64
+
+    first = Response(
+        id="response-1",
+        request_id="request-1",
+        status=ResponseStatus.OK,
+        payload_checksum=payload_checksum,
+        size_bytes=17,
+        created_at=_ts("2026-09-03T10:02:00.000000000Z"),
+        fetched_at=_ts("2026-09-03T10:02:01.000000000Z"),
+        adapter_meta={
+            "vendor_request_id": "vendor-1",
+        },
+    )
+
+    second = Response(
+        id="response-2",
+        request_id="request-2",
+        status=ResponseStatus.OK,
+        payload_checksum=payload_checksum,
+        size_bytes=17,
+        created_at=_ts("2026-09-03T10:03:00.000000000Z"),
+        fetched_at=_ts("2026-09-03T10:03:01.000000000Z"),
+        adapter_meta={
+            "vendor_request_id": "vendor-2",
+        },
+    )
+
+    assert first.id != second.id
+    assert first.request_id != second.request_id
+
+    assert first.payload_checksum == second.payload_checksum
+    assert first.size_bytes == second.size_bytes
+
+    assert first.adapter_meta != second.adapter_meta
+
+
+# ---------------------------------------------------------------------------
+# Resolution ontology
+# ---------------------------------------------------------------------------
+
+
+def test_one_response_can_represent_acquisition_and_later_reuse() -> None:
+    """Reuse points a later Request to the existing acquired Response."""
+
+    response = Response(
+        id="response-1",
+        request_id="request-1",
+        status=ResponseStatus.OK,
+        payload_checksum="b" * 64,
+        size_bytes=12,
+        created_at=_ts("2026-09-03T10:02:00.000000000Z"),
+        fetched_at=_ts("2026-09-03T10:02:01.000000000Z"),
+    )
+
+    acquired = Resolution(
+        request_id="request-1",
+        response_id=response.id,
+        kind=ResolutionKind.ACQUIRED,
+        resolved_at=_ts("2026-09-03T10:03:00.000000000Z"),
+    )
+
+    reused = Resolution(
+        request_id="request-2",
+        response_id=response.id,
+        kind=ResolutionKind.REUSED,
+        resolved_at=_ts("2026-09-03T10:05:00.000000000Z"),
+    )
+
+    assert response.request_id == acquired.request_id
+    assert response.request_id != reused.request_id
+
+    assert acquired.response_id == response.id
+    assert reused.response_id == response.id
+
+    assert acquired.kind is ResolutionKind.ACQUIRED
+    assert reused.kind is ResolutionKind.REUSED

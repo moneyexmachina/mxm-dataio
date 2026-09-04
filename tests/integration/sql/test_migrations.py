@@ -5,21 +5,25 @@ PostgreSQL server provided by Testcontainers, using one isolated schema per
 test.
 
 They prove the DataIO interaction-ledger schema contract: expected tables and
-PostgreSQL representations, request-occurrence identity, Session/Request
-ownership, important relational constraints and indexes, migration-ledger
-state, non-mutating inspection, idempotent replay, and isolation between test
+PostgreSQL representations, Request-occurrence identity, Session/Request
+ownership, Response acquisition provenance, Resolution relationships,
+important relational constraints and indexes, migration-ledger state,
+non-mutating inspection, idempotent replay, and isolation between test
 schemas.
 
 They also prove several architectural invariants encoded by the schema:
 
-- Session owns source and DataIO handling/reuse context;
-- Request owns one question occurrence and references its Session by ID;
-- question hash is not unique across request occurrences or Sessions;
+- Session owns source and cache/reuse context;
+- Request owns one logical-question occurrence and references its Session;
+- logical-question hash is not unique across Request occurrences or Sessions;
+- Response represents an actual external reply acquired by one Request;
+- distinct Responses may reference identical payload identity;
 - operational vocabularies are stored rather than authored by PostgreSQL;
-- resolution kind is part of the closed persistence ontology.
+- Resolution kind is part of the closed persistence ontology;
+- one Request occurrence has at most one final Resolution.
 
-Higher-level DataIO persistence, cache-resolution, and payload semantics are
-tested separately from the migration contract.
+Higher-level DataIO persistence, reuse-policy decisions, and object-store
+semantics are tested separately from the migration contract.
 """
 
 from __future__ import annotations
@@ -333,8 +337,8 @@ def _foreign_keys(
 
             if existing_table != referenced_table:
                 raise AssertionError(
-                    "PostgreSQL returned one foreign-key constraint referencing "
-                    "multiple tables."
+                    "PostgreSQL returned one foreign-key constraint "
+                    "referencing multiple tables."
                 )
 
             source_columns.append(
@@ -437,7 +441,6 @@ def test_packaged_migrations_create_expected_dataio_schema(
     ) == {
         "id",
         "source",
-        "mode",
         "cache_mode",
         "ttl_seconds",
         "as_of_bucket",
@@ -453,11 +456,36 @@ def test_packaged_migrations_create_expected_dataio_schema(
         "id",
         "session_id",
         "kind",
-        "method",
         "params",
-        "body",
         "hash",
         "created_at",
+    }
+
+    assert _column_names(
+        database,
+        table="responses",
+    ) == {
+        "id",
+        "request_id",
+        "status",
+        "created_at",
+        "fetched_at",
+        "payload_checksum",
+        "size_bytes",
+        "media_type",
+        "encoding",
+        "elapsed_ms",
+        "adapter_meta",
+    }
+
+    assert _column_names(
+        database,
+        table="resolutions",
+    ) == {
+        "request_id",
+        "response_id",
+        "kind",
+        "resolved_at",
     }
 
     jsonb_columns = _fetch_rows(
@@ -481,10 +509,6 @@ def test_packaged_migrations_create_expected_dataio_schema(
     assert jsonb_columns == [
         (
             "requests",
-            "body",
-        ),
-        (
-            "requests",
             "params",
         ),
         (
@@ -493,7 +517,7 @@ def test_packaged_migrations_create_expected_dataio_schema(
         ),
     ]
 
-    obsolete_path_columns = _fetch_rows(
+    obsolete_columns = _fetch_rows(
         database,
         sql.SQL(
             """
@@ -502,13 +526,22 @@ def test_packaged_migrations_create_expected_dataio_schema(
                 column_name
             FROM information_schema.columns
             WHERE table_schema = %s
-              AND column_name = 'path'
+              AND column_name IN (
+                  'path',
+                  'mode',
+                  'method',
+                  'body',
+                  'sequence'
+              )
+            ORDER BY
+                table_name,
+                column_name
             """
         ),
         (database.schema,),
     )
 
-    assert obsolete_path_columns == []
+    assert obsolete_columns == []
 
 
 def test_packaged_migrations_create_expected_relational_constraints(
@@ -530,8 +563,32 @@ def test_packaged_migrations_create_expected_relational_constraints(
         ("id",),
     }
 
-    # Session identity is its primary key. Source no longer participates in
-    # the Request relationship and therefore needs no composite uniqueness.
+    assert _constraint_columns(
+        database,
+        table="requests",
+        constraint_type="p",
+    ) == {
+        ("id",),
+    }
+
+    assert _constraint_columns(
+        database,
+        table="responses",
+        constraint_type="p",
+    ) == {
+        ("id",),
+    }
+
+    assert _constraint_columns(
+        database,
+        table="resolutions",
+        constraint_type="p",
+    ) == {
+        ("request_id",),
+    }
+
+    # Session identity is its primary key. Source is Session-owned context and
+    # does not participate in the Request foreign-key relationship.
     assert (
         "id",
         "source",
@@ -579,19 +636,19 @@ def test_packaged_migrations_create_expected_relational_constraints(
         ),
     }
 
-    assert _constraint_columns(
-        database,
-        table="resolutions",
-        constraint_type="p",
-    ) == {
-        ("request_id",),
-    }
-
-    # Question identity is deliberately not unique. Multiple request
-    # occurrences, including requests in different Sessions, may share H.
+    # Logical-question identity H is deliberately not unique. Multiple Request
+    # occurrences, including Requests in different Sessions, may share H.
     assert ("hash",) not in _constraint_columns(
         database,
         table="requests",
+        constraint_type="u",
+    )
+
+    # Payload identity is also deliberately not unique. Distinct external
+    # Response observations may contain byte-for-byte identical payloads.
+    assert ("payload_checksum",) not in _constraint_columns(
+        database,
+        table="responses",
         constraint_type="u",
     )
 
@@ -627,14 +684,14 @@ def test_packaged_migrations_create_expected_relational_constraints(
 
 
 # ---------------------------------------------------------------------------
-# Request occurrence / question identity
+# Request occurrence / logical-question identity
 # ---------------------------------------------------------------------------
 
 
 def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The same question hash may occur under different Session contexts."""
+    """The same logical-question hash may occur in different Session contexts."""
 
     database = migrated_postgres_database
 
@@ -645,7 +702,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                 INSERT INTO {} (
                     id,
                     source,
-                    mode,
                     cache_mode,
                     ttl_seconds,
                     as_of_bucket,
@@ -653,7 +709,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                     started_at
                 )
                 VALUES (
-                    %s,
                     %s,
                     %s,
                     %s,
@@ -675,7 +730,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                 (
                     "session-1",
                     "source-a",
-                    "sync",
                     "default",
                     300.0,
                     "bucket-a",
@@ -688,7 +742,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                 (
                     "session-2",
                     "source-b",
-                    "batch",
                     "bypass",
                     None,
                     "bucket-b",
@@ -702,15 +755,11 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                     id,
                     session_id,
                     kind,
-                    method,
                     params,
-                    body,
                     hash,
                     created_at
                 )
                 VALUES (
-                    %s,
-                    %s,
                     %s,
                     %s,
                     %s,
@@ -734,8 +783,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                     "request-1",
                     "session-1",
                     "example",
-                    "QUERY",
-                    None,
                     None,
                     question_hash,
                 ),
@@ -747,8 +794,6 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
                     "request-2",
                     "session-2",
                     "example",
-                    "QUERY",
-                    None,
                     None,
                     question_hash,
                 ),
@@ -790,7 +835,7 @@ def test_equivalent_questions_can_be_distinct_occurrences_across_sessions(
 def test_request_must_reference_existing_session(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Every request occurrence must belong to one persisted Session."""
+    """Every Request occurrence must belong to one persisted Session."""
 
     database = migrated_postgres_database
 
@@ -806,12 +851,10 @@ def test_request_must_reference_existing_session(
                             id,
                             session_id,
                             kind,
-                            method,
                             hash,
                             created_at
                         )
                         VALUES (
-                            %s,
                             %s,
                             %s,
                             %s,
@@ -829,10 +872,170 @@ def test_request_must_reference_existing_session(
                         "request-1",
                         "missing-session",
                         "example",
-                        "QUERY",
                         "a" * 64,
                     ),
                 )
+
+
+# ---------------------------------------------------------------------------
+# Response / payload identity
+# ---------------------------------------------------------------------------
+
+
+def test_distinct_responses_can_share_payload_identity(
+    migrated_postgres_database: PostgresDatabase,
+) -> None:
+    """Distinct external observations may reference identical payload bytes."""
+
+    database = migrated_postgres_database
+
+    with database.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {} (
+                        id,
+                        source,
+                        cache_mode,
+                        started_at
+                    )
+                    VALUES (
+                        'session-1',
+                        'example-source',
+                        'default',
+                        CURRENT_TIMESTAMP
+                    )
+                    """
+                ).format(
+                    sql.Identifier(
+                        database.schema,
+                        "sessions",
+                    )
+                )
+            )
+
+            request_insert = sql.SQL(
+                """
+                INSERT INTO {} (
+                    id,
+                    session_id,
+                    kind,
+                    hash,
+                    created_at
+                )
+                VALUES (
+                    %s,
+                    'session-1',
+                    'example',
+                    %s,
+                    CURRENT_TIMESTAMP
+                )
+                """
+            ).format(
+                sql.Identifier(
+                    database.schema,
+                    "requests",
+                )
+            )
+
+            cursor.execute(
+                request_insert,
+                (
+                    "request-1",
+                    "a" * 64,
+                ),
+            )
+
+            cursor.execute(
+                request_insert,
+                (
+                    "request-2",
+                    "a" * 64,
+                ),
+            )
+
+            response_insert = sql.SQL(
+                """
+                INSERT INTO {} (
+                    id,
+                    request_id,
+                    status,
+                    created_at,
+                    fetched_at,
+                    payload_checksum,
+                    size_bytes
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'ok',
+                    CURRENT_TIMESTAMP,
+                    CURRENT_TIMESTAMP,
+                    %s,
+                    %s
+                )
+                """
+            ).format(
+                sql.Identifier(
+                    database.schema,
+                    "responses",
+                )
+            )
+
+            payload_checksum = "b" * 64
+
+            cursor.execute(
+                response_insert,
+                (
+                    "response-1",
+                    "request-1",
+                    payload_checksum,
+                    12,
+                ),
+            )
+
+            cursor.execute(
+                response_insert,
+                (
+                    "response-2",
+                    "request-2",
+                    payload_checksum,
+                    12,
+                ),
+            )
+
+    rows = _fetch_rows(
+        database,
+        sql.SQL(
+            """
+            SELECT
+                id,
+                request_id,
+                payload_checksum
+            FROM {}
+            ORDER BY id
+            """
+        ).format(
+            sql.Identifier(
+                database.schema,
+                "responses",
+            )
+        ),
+    )
+
+    assert rows == [
+        (
+            "response-1",
+            "request-1",
+            "b" * 64,
+        ),
+        (
+            "response-2",
+            "request-2",
+            "b" * 64,
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +1058,10 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                     INSERT INTO {} (
                         id,
                         source,
-                        mode,
                         cache_mode,
                         started_at
                     )
                     VALUES (
-                        %s,
                         %s,
                         %s,
                         %s,
@@ -876,7 +1077,6 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                 (
                     "session-open-vocabulary",
                     "source-open-vocabulary",
-                    "future-session-mode",
                     "future-cache-policy",
                 ),
             )
@@ -888,12 +1088,10 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                         id,
                         session_id,
                         kind,
-                        method,
                         hash,
                         created_at
                     )
                     VALUES (
-                        %s,
                         %s,
                         %s,
                         %s,
@@ -911,7 +1109,6 @@ def test_operational_vocabularies_are_not_authored_by_sql(
                     "request-open-vocabulary",
                     "session-open-vocabulary",
                     "future-kind",
-                    "FUTURE_METHOD",
                     "b" * 64,
                 ),
             )
@@ -969,14 +1166,12 @@ def test_resolution_kind_is_closed_persistence_ontology(
                     INSERT INTO {} (
                         id,
                         source,
-                        mode,
                         cache_mode,
                         started_at
                     )
                     VALUES (
                         'session-1',
                         'example-source',
-                        'sync',
                         'default',
                         CURRENT_TIMESTAMP
                     )
@@ -996,7 +1191,6 @@ def test_resolution_kind_is_closed_persistence_ontology(
                         id,
                         session_id,
                         kind,
-                        method,
                         hash,
                         created_at
                     )
@@ -1004,7 +1198,6 @@ def test_resolution_kind_is_closed_persistence_ontology(
                         'request-1',
                         'session-1',
                         'example',
-                        'QUERY',
                         %s,
                         CURRENT_TIMESTAMP
                     )
@@ -1170,11 +1363,15 @@ def test_migration_state_is_versioned_current_and_idempotent(
         schema="dataio",
     )
 
-    assert dataio_tables.isdisjoint(_EXPECTED_TABLES)
+    assert dataio_tables.isdisjoint(
+        _EXPECTED_TABLES,
+    )
 
     public_tables = _table_names(
         database,
         schema="public",
     )
 
-    assert public_tables.isdisjoint(_EXPECTED_TABLES)
+    assert public_tables.isdisjoint(
+        _EXPECTED_TABLES,
+    )

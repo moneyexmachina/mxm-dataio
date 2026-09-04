@@ -2,12 +2,13 @@
 
 This module owns the PostgreSQL representation of ``Session`` objects.
 
-A session is an operational grouping of request occurrences for one external
-source. It also records the effective DataIO handling context under which those
-requests are resolved: cache policy, TTL, and opaque reuse-context
-discriminators.
+A Session is the stable source and cache context under which Request
+occurrences are resolved.
 
-It does not define temporal semantics for the observations collected within it.
+Model timestamps use the canonical MXM ``TSNSScalar`` representation.
+PostgreSQL stores timestamps as ``timestamptz``. The representation bridge
+between those forms lives in ``sql_timestamps``; this module translates
+timestamp-boundary failures into Session persistence errors.
 
 All functions operate on a caller-provided Psycopg connection. They do not
 open, commit, or roll back transactions. Transaction ownership belongs to the
@@ -21,18 +22,26 @@ from datetime import datetime
 
 from psycopg import Connection, sql
 
-from mxm.dataio.models import CacheMode, Session, SessionMode
+from mxm.dataio.models import CacheMode, Session
 from mxm.dataio.sql.postgres import PostgresRow
+from mxm.dataio.sql.sql_timestamps import (
+    SqlTimestampError,
+    optional_db_timestamp,
+    require_db_timestamp,
+    ts_ns_to_db_datetime,
+    validate_sql_timestamp,
+)
+from mxm.types.timestamps import TSNSScalar
 
 type ExecutableQuery = sql.SQL | sql.Composed
 
 
 class SessionPersistenceError(RuntimeError):
-    """Base error for invalid or inconsistent persisted session state."""
+    """Base error for invalid or inconsistent persisted Session state."""
 
 
 class SessionConflictError(SessionPersistenceError):
-    """Raised when one session ID identifies different session state."""
+    """Raised when one Session ID identifies different Session state."""
 
 
 # ---------------------------------------------------------------------
@@ -46,30 +55,18 @@ def fetch_session_by_id(
     schema: str,
     session_id: str,
 ) -> Session | None:
-    """Return one persisted session by ID, if present.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``sessions`` table.
-        session_id:
-            Session identifier to retrieve.
-
-    Returns:
-        The persisted session, or ``None`` when no such session exists.
-    """
+    """Return one persisted Session by ID, if present."""
 
     _validate_identifier(
         session_id,
         field="session_id",
     )
+
     query = sql.SQL(
         """
         SELECT
             id,
             source,
-            mode,
             cache_mode,
             ttl_seconds,
             as_of_bucket,
@@ -85,6 +82,7 @@ def fetch_session_by_id(
             "sessions",
         )
     )
+
     rows = _fetch_rows(
         connection,
         query,
@@ -109,20 +107,7 @@ def fetch_latest_session_id(
     schema: str,
     source: str,
 ) -> str | None:
-    """Return the most recently started session ID for one source.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``sessions`` table.
-        source:
-            External source whose latest session should be located.
-
-    Returns:
-        The latest session ID, or ``None`` when no session exists for the
-        requested source.
-    """
+    """Return the most recently started Session ID for one source."""
 
     _validate_identifier(
         source,
@@ -177,42 +162,27 @@ def insert_session(
     schema: str,
     session: Session,
 ) -> None:
-    """Persist one session idempotently while rejecting identity conflicts.
+    """Persist one Session idempotently while rejecting identity conflicts.
 
-    A session absent from the database is inserted.
+    A Session absent from the database is inserted.
 
-    A session already present with identical values is accepted as an
+    A Session already present with identical values is accepted as an
     idempotent no-op.
 
-    A session already present with different values raises
+    A Session already present with different values raises
     ``SessionConflictError``.
 
     Session completion is normally recorded separately with
     ``mark_session_ended``.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``sessions`` table.
-        session:
-            Session occurrence to persist.
-
-    Raises:
-        SessionConflictError:
-            If the session ID already identifies different persisted state.
-        SessionPersistenceError:
-            If the requested session is absent after insertion or invalid for
-            persistence.
     """
 
     _validate_session(session)
+
     query = sql.SQL(
         """
         INSERT INTO {} (
             id,
             source,
-            mode,
             cache_mode,
             ttl_seconds,
             as_of_bucket,
@@ -221,7 +191,6 @@ def insert_session(
             ended_at
         )
         VALUES (
-            %s,
             %s,
             %s,
             %s,
@@ -239,19 +208,29 @@ def insert_session(
             "sessions",
         )
     )
+
     with connection.cursor() as cursor:
         cursor.execute(
             query,
             (
                 session.id,
                 session.source,
-                session.mode.value,
                 session.cache_mode.value,
                 session.ttl_seconds,
                 session.as_of_bucket,
                 session.cache_tag,
-                session.started_at,
-                session.ended_at,
+                _ts_ns_to_db_datetime(
+                    session.started_at,
+                    field="started_at",
+                ),
+                (
+                    _ts_ns_to_db_datetime(
+                        session.ended_at,
+                        field="ended_at",
+                    )
+                    if session.ended_at is not None
+                    else None
+                ),
             ),
         )
 
@@ -268,7 +247,7 @@ def insert_session(
 
     if persisted_session != session:
         raise SessionConflictError(
-            "Persisted session conflicts with requested session for "
+            "Persisted Session conflicts with requested Session for "
             f"session_id {session.id!r}: "
             f"persisted={persisted_session!r}, "
             f"requested={session!r}"
@@ -280,32 +259,16 @@ def mark_session_ended(
     *,
     schema: str,
     session_id: str,
-    ended_at: datetime,
+    ended_at: TSNSScalar,
 ) -> None:
-    """Record completion of one persisted session.
+    """Record completion of one persisted Session.
 
     Session completion is monotonic:
 
-    - an open session may acquire one ``ended_at`` timestamp;
+    - an open Session may acquire one ``ended_at`` timestamp;
     - repeating the identical completion is an idempotent no-op;
     - attempting to replace an existing completion timestamp raises
       ``SessionConflictError``.
-
-    Args:
-        connection:
-            Active Psycopg connection owned by the caller.
-        schema:
-            PostgreSQL schema containing the ``sessions`` table.
-        session_id:
-            Session occurrence to complete.
-        ended_at:
-            Timestamp at which the session completed.
-
-    Raises:
-        SessionPersistenceError:
-            If the session does not exist or timestamps are invalid.
-        SessionConflictError:
-            If the session has already been completed at a different time.
     """
 
     _validate_identifier(
@@ -313,7 +276,7 @@ def mark_session_ended(
         field="session_id",
     )
 
-    _validate_datetime(
+    _validate_timestamp(
         ended_at,
         field="ended_at",
     )
@@ -326,7 +289,7 @@ def mark_session_ended(
 
     if existing_session is None:
         raise SessionPersistenceError(
-            f"Cannot end a session that is not persisted: session_id={session_id!r}"
+            f"Cannot end a Session that is not persisted: session_id={session_id!r}"
         )
 
     if ended_at < existing_session.started_at:
@@ -342,7 +305,7 @@ def mark_session_ended(
             return
 
         raise SessionConflictError(
-            "Persisted session already has a different completion time: "
+            "Persisted Session already has a different completion time: "
             f"session_id={session_id!r}, "
             f"persisted={existing_session.ended_at!r}, "
             f"requested={ended_at!r}"
@@ -366,7 +329,10 @@ def mark_session_ended(
         cursor.execute(
             query,
             (
-                ended_at,
+                _ts_ns_to_db_datetime(
+                    ended_at,
+                    field="ended_at",
+                ),
                 session_id,
             ),
         )
@@ -384,7 +350,7 @@ def mark_session_ended(
 
     if persisted_session.ended_at != ended_at:
         raise SessionConflictError(
-            "Persisted session completion differs from requested value: "
+            "Persisted Session completion differs from requested value: "
             f"session_id={session_id!r}, "
             f"persisted={persisted_session.ended_at!r}, "
             f"requested={ended_at!r}"
@@ -423,9 +389,9 @@ def _fetch_rows(
 def _session_from_row(
     row: PostgresRow,
 ) -> Session:
-    """Reconstruct one validated session from a database row."""
+    """Reconstruct one validated Session from a PostgreSQL row."""
 
-    if len(row) != 9:
+    if len(row) != 8:
         raise SessionPersistenceError(
             f"Session query returned an unexpected row shape: {row!r}"
         )
@@ -440,59 +406,46 @@ def _session_from_row(
         field="source",
     )
 
-    mode_text = _require_text(
-        row[2],
-        field="mode",
-    )
-
     cache_mode_text = _require_text(
-        row[3],
+        row[2],
         field="cache_mode",
     )
 
     ttl_seconds = _optional_non_negative_float(
-        row[4],
+        row[3],
         field="ttl_seconds",
     )
 
     as_of_bucket = _optional_text(
-        row[5],
+        row[4],
         field="as_of_bucket",
     )
 
     cache_tag = _optional_text(
-        row[6],
+        row[5],
         field="cache_tag",
     )
 
-    started_at = _require_datetime(
-        row[7],
+    started_at = _require_db_timestamp(
+        row[6],
         field="started_at",
     )
 
-    ended_at = _optional_datetime(
-        row[8],
+    ended_at = _optional_db_timestamp(
+        row[7],
         field="ended_at",
     )
-
-    try:
-        mode = SessionMode(mode_text)
-    except ValueError as err:
-        raise SessionPersistenceError(
-            f"Persisted session mode is not recognised: {mode_text!r}"
-        ) from err
 
     try:
         cache_mode = CacheMode(cache_mode_text)
     except ValueError as err:
         raise SessionPersistenceError(
-            f"Persisted session cache_mode is not recognised: {cache_mode_text!r}"
+            f"Persisted Session cache_mode is not recognised: {cache_mode_text!r}"
         ) from err
 
     session = Session(
         id=session_id,
         source=source,
-        mode=mode,
         cache_mode=cache_mode,
         ttl_seconds=ttl_seconds,
         as_of_bucket=as_of_bucket,
@@ -507,6 +460,75 @@ def _session_from_row(
 
 
 # ---------------------------------------------------------------------
+# TIMESTAMP BOUNDARY ERROR TRANSLATION
+# ---------------------------------------------------------------------
+
+
+def _validate_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Validate one Session timestamp for PostgreSQL persistence."""
+
+    try:
+        return validate_sql_timestamp(
+            value,
+            field=f"Session {field}",
+        )
+    except SqlTimestampError as err:
+        raise SessionPersistenceError(str(err)) from err
+
+
+def _ts_ns_to_db_datetime(
+    value: TSNSScalar,
+    *,
+    field: str,
+) -> datetime:
+    """Convert one Session timestamp to the Psycopg representation."""
+
+    try:
+        return ts_ns_to_db_datetime(
+            value,
+            field=f"Session {field}",
+        )
+    except SqlTimestampError as err:
+        raise SessionPersistenceError(str(err)) from err
+
+
+def _require_db_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Convert one required persisted Session timestamp."""
+
+    try:
+        return require_db_timestamp(
+            value,
+            field=f"Persisted Session {field}",
+        )
+    except SqlTimestampError as err:
+        raise SessionPersistenceError(str(err)) from err
+
+
+def _optional_db_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar | None:
+    """Convert one nullable persisted Session timestamp."""
+
+    try:
+        return optional_db_timestamp(
+            value,
+            field=f"Persisted Session {field}",
+        )
+    except SqlTimestampError as err:
+        raise SessionPersistenceError(str(err)) from err
+
+
+# ---------------------------------------------------------------------
 # VALIDATION
 # ---------------------------------------------------------------------
 
@@ -514,7 +536,7 @@ def _session_from_row(
 def _validate_session(
     session: Session,
 ) -> None:
-    """Validate persistence-level session invariants."""
+    """Validate persistence-level Session invariants."""
 
     _validate_identifier(
         session.id,
@@ -541,13 +563,13 @@ def _validate_session(
         field="cache_tag",
     )
 
-    _validate_datetime(
+    _validate_timestamp(
         session.started_at,
         field="started_at",
     )
 
     if session.ended_at is not None:
-        _validate_datetime(
+        _validate_timestamp(
             session.ended_at,
             field="ended_at",
         )
@@ -568,13 +590,7 @@ def _validate_identifier(
 ) -> None:
     """Require a non-empty text identifier."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
+    if not isinstance(value, str) or not value:
         raise SessionPersistenceError(
             f"Session {field} must be non-empty text, got {value!r}"
         )
@@ -587,80 +603,12 @@ def _require_text(
 ) -> str:
     """Require a non-empty persisted text value."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
+    if not isinstance(value, str) or not value:
         raise SessionPersistenceError(
-            f"Persisted session {field} must be non-empty text, got {value!r}"
+            f"Persisted Session {field} must be non-empty text, got {value!r}"
         )
 
     return value
-
-
-def _validate_datetime(
-    value: object,
-    *,
-    field: str,
-) -> datetime:
-    """Require a timezone-aware datetime."""
-
-    if not isinstance(
-        value,
-        datetime,
-    ):
-        raise SessionPersistenceError(
-            f"Session {field} must be a datetime, got {value!r}"
-        )
-
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise SessionPersistenceError(
-            f"Session {field} must be timezone-aware, got {value!r}"
-        )
-
-    return value
-
-
-def _require_datetime(
-    value: object,
-    *,
-    field: str,
-) -> datetime:
-    """Require a timezone-aware persisted datetime."""
-
-    if not isinstance(
-        value,
-        datetime,
-    ):
-        raise SessionPersistenceError(
-            f"Persisted session {field} must be a datetime, got {value!r}"
-        )
-
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise SessionPersistenceError(
-            f"Persisted session {field} must be timezone-aware, got {value!r}"
-        )
-
-    return value
-
-
-def _optional_datetime(
-    value: object,
-    *,
-    field: str,
-) -> datetime | None:
-    """Require a timezone-aware persisted datetime or NULL."""
-
-    if value is None:
-        return None
-
-    return _require_datetime(
-        value,
-        field=field,
-    )
 
 
 def _validate_optional_non_negative_float(
@@ -702,7 +650,7 @@ def _optional_non_negative_float(
         or value < 0
     ):
         raise SessionPersistenceError(
-            f"Persisted session {field} must be a finite non-negative number "
+            f"Persisted Session {field} must be a finite non-negative number "
             f"or NULL, got {value!r}"
         )
 
@@ -734,7 +682,7 @@ def _optional_text(
 
     if not isinstance(value, str):
         raise SessionPersistenceError(
-            f"Persisted session {field} must be text or NULL, got {value!r}"
+            f"Persisted Session {field} must be text or NULL, got {value!r}"
         )
 
     return value

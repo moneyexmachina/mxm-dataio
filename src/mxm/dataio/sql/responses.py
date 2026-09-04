@@ -1,10 +1,36 @@
-"""Plain-SQL persistence operations for DataIO response observations."""
+"""Plain-SQL persistence operations for DataIO Response observations.
+
+This module owns the PostgreSQL representation of ``Response`` objects.
+
+A Response represents one actual external reply occurrence acquired by one
+Request.
+
+``Response.id`` identifies the external reply occurrence.
+
+``Response.request_id`` identifies the Request occurrence that actually
+acquired that reply from the external source. A later Request that reuses this
+Response refers to it through a Resolution; reuse never fabricates another
+Response.
+
+``Response.payload_checksum`` identifies the exact immutable payload bytes.
+Different Response observations may legitimately reference the same payload
+identity when an external source returns byte-for-byte identical replies.
+
+Model timestamps use the canonical MXM ``TSNSScalar`` representation.
+PostgreSQL stores timestamps as ``timestamptz``. The representation bridge
+between those forms lives in ``sql_timestamps``; this module translates
+timestamp-boundary failures into Response persistence errors.
+
+All functions operate on a caller-provided Psycopg connection. They do not
+open, commit, or roll back transactions. Transaction ownership belongs to the
+higher-level DataIO operation.
+"""
 
 from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Sequence
 from datetime import datetime
 from typing import cast
 
@@ -13,22 +39,35 @@ from psycopg.types.json import Jsonb
 
 from mxm.dataio.models import Response, ResponseStatus
 from mxm.dataio.sql.postgres import PostgresRow
+from mxm.dataio.sql.sql_timestamps import (
+    SqlTimestampError,
+    require_db_timestamp,
+    ts_ns_to_db_datetime,
+    validate_sql_timestamp,
+)
 from mxm.types import JSONObj
+from mxm.types.timestamps import TSNSScalar
 
-_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+type ExecutableQuery = sql.SQL | sql.Composed
+
+
+_SHA256_PATTERN = re.compile(
+    r"^[0-9a-f]{64}$",
+    flags=re.ASCII,
+)
 
 
 class ResponsePersistenceError(RuntimeError):
-    """Response state cannot be represented safely at the SQL boundary."""
+    """Base error for invalid or inconsistent persisted Response state."""
 
 
 class ResponseConflictError(ResponsePersistenceError):
-    """One response ID refers to conflicting persisted observation state."""
+    """Raised when one Response ID identifies different observation state."""
 
 
-# ---------------------------------------------------------------------------
-# Public lookup operations
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# RESPONSE READS
+# ---------------------------------------------------------------------
 
 
 def fetch_response_by_id(
@@ -37,11 +76,11 @@ def fetch_response_by_id(
     schema: str,
     response_id: str,
 ) -> Response | None:
-    """Return one persisted response observation by identity."""
+    """Return one persisted Response observation by ID, if present."""
 
-    _validate_non_empty_text(
+    _validate_identifier(
         response_id,
-        field_name="response_id",
+        field="response_id",
     )
 
     query = sql.SQL(
@@ -50,7 +89,6 @@ def fetch_response_by_id(
             id,
             request_id,
             status,
-            sequence,
             created_at,
             fetched_at,
             payload_checksum,
@@ -59,26 +97,29 @@ def fetch_response_by_id(
             encoding,
             elapsed_ms,
             adapter_meta
-        FROM {}.responses
+        FROM {}
         WHERE id = %s
         """
     ).format(
-        sql.Identifier(schema),
+        sql.Identifier(
+            schema,
+            "responses",
+        )
     )
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            query,
-            (response_id,),
-        )
-        rows = cursor.fetchall()
+    rows = _fetch_rows(
+        connection,
+        query,
+        (response_id,),
+    )
 
     if not rows:
         return None
 
     if len(rows) != 1:
         raise ResponsePersistenceError(
-            f"Response lookup returned multiple rows for response_id={response_id!r}"
+            "Response query returned multiple rows for "
+            f"response_id {response_id!r}: {rows!r}"
         )
 
     return _response_from_row(
@@ -92,16 +133,19 @@ def fetch_responses_by_request_id(
     schema: str,
     request_id: str,
 ) -> dict[str, Response]:
-    """Return observations acquired by one request occurrence.
+    """Return Responses actually acquired by one Request occurrence.
 
-    Results are keyed by response identity. Ordering of the returned mapping
-    follows ``created_at, id`` for deterministic inspection, without assigning
-    additional streaming semantics to ``sequence``.
+    Results are keyed by Response ID and deterministically ordered by
+    ``created_at, id``.
+
+    This lookup concerns acquisition provenance only. A Request that reused a
+    pre-existing Response is related to that Response through ``Resolution``,
+    not through ``Response.request_id``.
     """
 
-    _validate_non_empty_text(
+    _validate_identifier(
         request_id,
-        field_name="request_id",
+        field="request_id",
     )
 
     query = sql.SQL(
@@ -110,7 +154,6 @@ def fetch_responses_by_request_id(
             id,
             request_id,
             status,
-            sequence,
             created_at,
             fetched_at,
             payload_checksum,
@@ -119,35 +162,29 @@ def fetch_responses_by_request_id(
             encoding,
             elapsed_ms,
             adapter_meta
-        FROM {}.responses
+        FROM {}
         WHERE request_id = %s
-        ORDER BY created_at, id
+        ORDER BY
+            created_at,
+            id
         """
     ).format(
-        sql.Identifier(schema),
+        sql.Identifier(
+            schema,
+            "responses",
+        )
     )
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            query,
-            (request_id,),
-        )
-        rows = cursor.fetchall()
+    rows = _fetch_rows(
+        connection,
+        query,
+        (request_id,),
+    )
 
-    responses: dict[str, Response] = {}
-
-    for row in rows:
-        response = _response_from_row(row)
-
-        if response.id in responses:
-            raise ResponsePersistenceError(
-                "Response query returned duplicate observation identity: "
-                f"{response.id!r}"
-            )
-
-        responses[response.id] = response
-
-    return responses
+    return _responses_from_rows(
+        rows,
+        duplicate_error="Response query returned duplicate Response ID",
+    )
 
 
 def fetch_responses_by_payload_checksum(
@@ -156,11 +193,11 @@ def fetch_responses_by_payload_checksum(
     schema: str,
     payload_checksum: str,
 ) -> dict[str, Response]:
-    """Return observations that reference one exact payload identity."""
+    """Return Response observations referencing one exact payload identity."""
 
-    _validate_sha256(
+    _validate_hash(
         payload_checksum,
-        field_name="payload_checksum",
+        field="payload_checksum",
     )
 
     query = sql.SQL(
@@ -169,7 +206,6 @@ def fetch_responses_by_payload_checksum(
             id,
             request_id,
             status,
-            sequence,
             created_at,
             fetched_at,
             payload_checksum,
@@ -178,40 +214,34 @@ def fetch_responses_by_payload_checksum(
             encoding,
             elapsed_ms,
             adapter_meta
-        FROM {}.responses
+        FROM {}
         WHERE payload_checksum = %s
-        ORDER BY created_at, id
+        ORDER BY
+            created_at,
+            id
         """
     ).format(
-        sql.Identifier(schema),
+        sql.Identifier(
+            schema,
+            "responses",
+        )
     )
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            query,
-            (payload_checksum,),
-        )
-        rows = cursor.fetchall()
+    rows = _fetch_rows(
+        connection,
+        query,
+        (payload_checksum,),
+    )
 
-    responses: dict[str, Response] = {}
-
-    for row in rows:
-        response = _response_from_row(row)
-
-        if response.id in responses:
-            raise ResponsePersistenceError(
-                "Payload lookup returned duplicate response observation: "
-                f"{response.id!r}"
-            )
-
-        responses[response.id] = response
-
-    return responses
+    return _responses_from_rows(
+        rows,
+        duplicate_error="Payload lookup returned duplicate Response ID",
+    )
 
 
-# ---------------------------------------------------------------------------
-# Public persistence operation
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# RESPONSE WRITES
+# ---------------------------------------------------------------------
 
 
 def insert_response(
@@ -220,13 +250,18 @@ def insert_response(
     schema: str,
     response: Response,
 ) -> None:
-    """Persist one immutable external response observation.
+    """Persist one immutable external Response observation idempotently.
 
-    Insertion is idempotent when the same response ID already represents
-    identical state. The same response ID cannot be reused for different
-    observation state.
+    A Response absent from the database is inserted.
 
-    Transaction ownership remains with the caller.
+    A Response already present with the same ID and identical state is accepted
+    as an idempotent no-op.
+
+    A Response already present with the same ID but different state raises
+    ``ResponseConflictError``.
+
+    Different Responses may legitimately reference the same immutable payload
+    checksum.
     """
 
     _validate_response(
@@ -235,11 +270,10 @@ def insert_response(
 
     query = sql.SQL(
         """
-        INSERT INTO {}.responses (
+        INSERT INTO {} (
             id,
             request_id,
             status,
-            sequence,
             created_at,
             fetched_at,
             payload_checksum,
@@ -260,19 +294,19 @@ def insert_response(
             %s,
             %s,
             %s,
-            %s,
             %s
         )
         ON CONFLICT (id) DO NOTHING
         """
     ).format(
-        sql.Identifier(schema),
+        sql.Identifier(
+            schema,
+            "responses",
+        )
     )
 
-    adapter_meta = (
-        Jsonb(dict(response.adapter_meta))
-        if response.adapter_meta is not None
-        else None
+    adapter_meta_value = (
+        Jsonb(response.adapter_meta) if response.adapter_meta is not None else None
     )
 
     with connection.cursor() as cursor:
@@ -282,288 +316,393 @@ def insert_response(
                 response.id,
                 response.request_id,
                 response.status.value,
-                response.sequence,
-                response.created_at,
-                response.fetched_at,
+                _ts_ns_to_db_datetime(
+                    response.created_at,
+                    field="created_at",
+                ),
+                _ts_ns_to_db_datetime(
+                    response.fetched_at,
+                    field="fetched_at",
+                ),
                 response.payload_checksum,
                 response.size_bytes,
                 response.media_type,
                 response.encoding,
                 response.elapsed_ms,
-                adapter_meta,
+                adapter_meta_value,
             ),
         )
 
-    persisted = fetch_response_by_id(
+    persisted_response = fetch_response_by_id(
         connection,
         schema=schema,
         response_id=response.id,
     )
 
-    if persisted is None:
+    if persisted_response is None:
         raise ResponsePersistenceError(
-            f"Response is not present after insertion: response_id={response.id!r}"
+            f"Response was not present after insertion: response_id={response.id!r}"
         )
 
-    if persisted != response:
+    if persisted_response != response:
         raise ResponseConflictError(
-            "Persisted response conflicts with requested observation: "
-            f"response_id={response.id!r}"
+            "Persisted Response conflicts with requested observation for "
+            f"response_id {response.id!r}: "
+            f"persisted={persisted_response!r}, "
+            f"requested={response!r}"
         )
 
 
-# ---------------------------------------------------------------------------
-# Row reconstruction
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# PRIVATE QUERY HELPERS
+# ---------------------------------------------------------------------
+
+
+def _fetch_rows(
+    connection: Connection[PostgresRow],
+    query: ExecutableQuery,
+    parameters: tuple[object, ...] | None = None,
+) -> list[PostgresRow]:
+    """Execute one query and return all result rows."""
+
+    with connection.cursor() as cursor:
+        if parameters is None:
+            cursor.execute(query)
+        else:
+            cursor.execute(
+                query,
+                parameters,
+            )
+
+        return cursor.fetchall()
+
+
+# ---------------------------------------------------------------------
+# ROW RECONSTRUCTION
+# ---------------------------------------------------------------------
+
+
+def _responses_from_rows(
+    rows: Sequence[PostgresRow],
+    *,
+    duplicate_error: str,
+) -> dict[str, Response]:
+    """Reconstruct Responses while rejecting duplicate observation IDs."""
+
+    responses: dict[str, Response] = {}
+
+    for row in rows:
+        response = _response_from_row(
+            row,
+        )
+
+        if response.id in responses:
+            raise ResponsePersistenceError(f"{duplicate_error} {response.id!r}")
+
+        responses[response.id] = response
+
+    return responses
 
 
 def _response_from_row(
     row: PostgresRow,
 ) -> Response:
-    """Reconstruct and validate one Response from a PostgreSQL row."""
+    """Reconstruct one validated Response from a PostgreSQL row."""
 
-    if len(row) != 12:
+    if len(row) != 11:
         raise ResponsePersistenceError(
-            "Response query returned unexpected row shape: "
-            f"expected=12, actual={len(row)}"
+            f"Response query returned an unexpected row shape: {row!r}"
         )
 
-    (
-        response_id,
-        request_id,
-        status_value,
-        sequence,
-        created_at,
-        fetched_at,
-        payload_checksum,
-        size_bytes,
-        media_type,
-        encoding,
-        elapsed_ms,
-        adapter_meta,
-    ) = row
-
-    _validate_non_empty_text(
-        response_id,
-        field_name="id",
-    )
-    _validate_non_empty_text(
-        request_id,
-        field_name="request_id",
+    response_id = _require_text(
+        row[0],
+        field="id",
     )
 
-    if not isinstance(
-        status_value,
-        str,
-    ):
-        raise ResponsePersistenceError("status must be text")
+    request_id = _require_text(
+        row[1],
+        field="request_id",
+    )
+
+    status_text = _require_text(
+        row[2],
+        field="status",
+    )
+
+    created_at = _require_db_timestamp(
+        row[3],
+        field="created_at",
+    )
+
+    fetched_at = _require_db_timestamp(
+        row[4],
+        field="fetched_at",
+    )
+
+    payload_checksum = _require_hash(
+        row[5],
+        field="payload_checksum",
+    )
+
+    size_bytes = _require_non_negative_int(
+        row[6],
+        field="size_bytes",
+    )
+
+    media_type = _optional_text(
+        row[7],
+        field="media_type",
+    )
+
+    encoding = _optional_text(
+        row[8],
+        field="encoding",
+    )
+
+    elapsed_ms = _optional_non_negative_int(
+        row[9],
+        field="elapsed_ms",
+    )
+
+    adapter_meta = _optional_json_object(
+        row[10],
+        field="adapter_meta",
+    )
 
     try:
         status = ResponseStatus(
-            status_value,
+            status_text,
         )
-    except ValueError as exc:
+    except ValueError as err:
         raise ResponsePersistenceError(
-            f"status is not recognised: {status_value!r}"
-        ) from exc
+            f"Persisted Response status is not recognised: {status_text!r}"
+        ) from err
 
-    _validate_optional_non_negative_int(
-        sequence,
-        field_name="sequence",
-    )
-
-    _validate_datetime(
-        created_at,
-        field_name="created_at",
-    )
-    _validate_datetime(
-        fetched_at,
-        field_name="fetched_at",
-    )
-
-    _validate_sha256(
-        payload_checksum,
-        field_name="payload_checksum",
-    )
-
-    _validate_non_negative_int(
-        size_bytes,
-        field_name="size_bytes",
-    )
-
-    _validate_optional_text(
-        media_type,
-        field_name="media_type",
-    )
-    _validate_optional_text(
-        encoding,
-        field_name="encoding",
-    )
-
-    _validate_optional_non_negative_int(
-        elapsed_ms,
-        field_name="elapsed_ms",
-    )
-
-    _validate_json_object_or_none(
-        adapter_meta,
-        field_name="adapter_meta",
-    )
-
-    return Response(
-        id=cast(str, response_id),
-        request_id=cast(str, request_id),
+    response = Response(
+        id=response_id,
+        request_id=request_id,
         status=status,
-        sequence=cast(int | None, sequence),
-        created_at=cast(datetime, created_at),
-        fetched_at=cast(datetime, fetched_at),
-        payload_checksum=cast(str, payload_checksum),
-        size_bytes=cast(int, size_bytes),
-        media_type=cast(str | None, media_type),
-        encoding=cast(str | None, encoding),
-        elapsed_ms=cast(int | None, elapsed_ms),
-        adapter_meta=cast(JSONObj | None, adapter_meta),
+        created_at=created_at,
+        fetched_at=fetched_at,
+        payload_checksum=payload_checksum,
+        size_bytes=size_bytes,
+        media_type=media_type,
+        encoding=encoding,
+        elapsed_ms=elapsed_ms,
+        adapter_meta=adapter_meta,
     )
 
+    _validate_response(
+        response,
+    )
 
-# ---------------------------------------------------------------------------
-# Persistence validation
-# ---------------------------------------------------------------------------
+    return response
+
+
+# ---------------------------------------------------------------------
+# TIMESTAMP BOUNDARY ERROR TRANSLATION
+# ---------------------------------------------------------------------
+
+
+def _validate_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Validate one Response timestamp for PostgreSQL persistence."""
+
+    try:
+        return validate_sql_timestamp(
+            value,
+            field=f"Response {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResponsePersistenceError(str(err)) from err
+
+
+def _ts_ns_to_db_datetime(
+    value: TSNSScalar,
+    *,
+    field: str,
+) -> datetime:
+    """Convert one Response timestamp to the Psycopg representation."""
+
+    try:
+        return ts_ns_to_db_datetime(
+            value,
+            field=f"Response {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResponsePersistenceError(str(err)) from err
+
+
+def _require_db_timestamp(
+    value: object,
+    *,
+    field: str,
+) -> TSNSScalar:
+    """Convert one required persisted Response timestamp."""
+
+    try:
+        return require_db_timestamp(
+            value,
+            field=f"Persisted Response {field}",
+        )
+    except SqlTimestampError as err:
+        raise ResponsePersistenceError(str(err)) from err
+
+
+# ---------------------------------------------------------------------
+# VALIDATION
+# ---------------------------------------------------------------------
 
 
 def _validate_response(
     response: Response,
 ) -> None:
-    """Validate Response state before crossing the SQL boundary."""
+    """Validate persistence-level Response observation invariants."""
 
-    _validate_non_empty_text(
+    _validate_identifier(
         response.id,
-        field_name="id",
+        field="id",
     )
-    _validate_non_empty_text(
+
+    _validate_identifier(
         response.request_id,
-        field_name="request_id",
+        field="request_id",
     )
 
-    _validate_optional_non_negative_int(
-        response.sequence,
-        field_name="sequence",
-    )
-
-    _validate_datetime(
+    _validate_timestamp(
         response.created_at,
-        field_name="created_at",
-    )
-    _validate_datetime(
-        response.fetched_at,
-        field_name="fetched_at",
+        field="created_at",
     )
 
-    _validate_sha256(
+    _validate_timestamp(
+        response.fetched_at,
+        field="fetched_at",
+    )
+
+    _validate_hash(
         response.payload_checksum,
-        field_name="payload_checksum",
+        field="payload_checksum",
     )
 
     _validate_non_negative_int(
         response.size_bytes,
-        field_name="size_bytes",
+        field="size_bytes",
     )
 
     _validate_optional_text(
         response.media_type,
-        field_name="media_type",
+        field="media_type",
     )
+
     _validate_optional_text(
         response.encoding,
-        field_name="encoding",
+        field="encoding",
     )
 
     _validate_optional_non_negative_int(
         response.elapsed_ms,
-        field_name="elapsed_ms",
+        field="elapsed_ms",
     )
 
     _validate_json_object_or_none(
         response.adapter_meta,
-        field_name="adapter_meta",
+        field="adapter_meta",
     )
 
 
-def _validate_non_empty_text(
+def _validate_identifier(
     value: object,
     *,
-    field_name: str,
+    field: str,
 ) -> None:
-    """Require non-empty text."""
+    """Require a non-empty text identifier."""
 
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or not value
-    ):
-        raise ResponsePersistenceError(f"{field_name} must be non-empty text")
-
-
-def _validate_optional_text(
-    value: object,
-    *,
-    field_name: str,
-) -> None:
-    """Require text or NULL."""
-
-    if value is not None and not isinstance(
-        value,
-        str,
-    ):
-        raise ResponsePersistenceError(f"{field_name} must be text or NULL")
-
-
-def _validate_sha256(
-    value: object,
-    *,
-    field_name: str,
-) -> None:
-    """Require a canonical lowercase SHA-256 hexadecimal digest."""
-
-    if (
-        not isinstance(
-            value,
-            str,
-        )
-        or _SHA256_PATTERN.fullmatch(value) is None
-    ):
+    if not isinstance(value, str) or not value:
         raise ResponsePersistenceError(
-            f"{field_name} must be a 64-character lowercase hexadecimal SHA-256 value"
+            f"Response {field} must be non-empty text, got {value!r}"
         )
+
+
+def _require_text(
+    value: object,
+    *,
+    field: str,
+) -> str:
+    """Require a non-empty persisted text value."""
+
+    if not isinstance(value, str) or not value:
+        raise ResponsePersistenceError(
+            f"Persisted Response {field} must be non-empty text, got {value!r}"
+        )
+
+    return value
+
+
+def _validate_hash(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    """Require a lowercase hexadecimal SHA-256 digest."""
+
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ResponsePersistenceError(
+            f"Response {field} must be a 64-character lowercase hexadecimal "
+            f"SHA-256 value, got {value!r}"
+        )
+
+
+def _require_hash(
+    value: object,
+    *,
+    field: str,
+) -> str:
+    """Require and return one persisted SHA-256 digest."""
+
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ResponsePersistenceError(
+            f"Persisted Response {field} must be a 64-character lowercase "
+            f"hexadecimal SHA-256 value, got {value!r}"
+        )
+
+    return value
 
 
 def _validate_non_negative_int(
     value: object,
     *,
-    field_name: str,
+    field: str,
 ) -> None:
     """Require a non-negative integer."""
 
-    if (
-        not isinstance(
-            value,
-            int,
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResponsePersistenceError(
+            f"Response {field} must be a non-negative integer, got {value!r}"
         )
-        or isinstance(
-            value,
-            bool,
+
+
+def _require_non_negative_int(
+    value: object,
+    *,
+    field: str,
+) -> int:
+    """Require and return a persisted non-negative integer."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResponsePersistenceError(
+            f"Persisted Response {field} must be a non-negative integer, got {value!r}"
         )
-        or value < 0
-    ):
-        raise ResponsePersistenceError(f"{field_name} must be a non-negative integer")
+
+    return value
 
 
 def _validate_optional_non_negative_int(
     value: object,
     *,
-    field_name: str,
+    field: str,
 ) -> None:
     """Require a non-negative integer or NULL."""
 
@@ -572,134 +711,195 @@ def _validate_optional_non_negative_int(
 
     _validate_non_negative_int(
         value,
-        field_name=field_name,
+        field=field,
     )
 
 
-def _validate_datetime(
+def _optional_non_negative_int(
     value: object,
     *,
-    field_name: str,
+    field: str,
+) -> int | None:
+    """Require and return a persisted non-negative integer or NULL."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ResponsePersistenceError(
+            f"Persisted Response {field} must be a non-negative integer "
+            f"or NULL, got {value!r}"
+        )
+
+    return value
+
+
+def _validate_optional_text(
+    value: object,
+    *,
+    field: str,
 ) -> None:
-    """Require a timezone-aware datetime."""
+    """Require text or NULL."""
 
-    if not isinstance(
+    if value is not None and not isinstance(value, str):
+        raise ResponsePersistenceError(
+            f"Response {field} must be text or NULL, got {value!r}"
+        )
+
+
+def _optional_text(
+    value: object,
+    *,
+    field: str,
+) -> str | None:
+    """Require persisted text or NULL."""
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise ResponsePersistenceError(
+            f"Persisted Response {field} must be text or NULL, got {value!r}"
+        )
+
+    return value
+
+
+# ---------------------------------------------------------------------
+# JSON VALIDATION
+# ---------------------------------------------------------------------
+
+
+def _optional_json_object(
+    value: object,
+    *,
+    field: str,
+) -> JSONObj | None:
+    """Require a persisted JSON object or NULL."""
+
+    if value is None:
+        return None
+
+    _validate_json_object(
         value,
-        datetime,
-    ):
-        raise ResponsePersistenceError(f"{field_name} must be a datetime")
+        field=field,
+        persisted=True,
+    )
 
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ResponsePersistenceError(f"{field_name} must be timezone-aware")
+    return cast(
+        JSONObj,
+        value,
+    )
 
 
 def _validate_json_object_or_none(
     value: object,
     *,
-    field_name: str,
+    field: str,
 ) -> None:
     """Require a JSON object or NULL."""
 
     if value is None:
         return
 
-    if not isinstance(
+    _validate_json_object(
         value,
-        Mapping,
-    ):
-        raise ResponsePersistenceError(f"{field_name} must be a JSON object or NULL")
+        field=field,
+        persisted=False,
+    )
 
-    mapping = cast(
-        Mapping[object, object],
+
+def _validate_json_object(
+    value: object,
+    *,
+    field: str,
+    persisted: bool,
+) -> None:
+    """Require a JSON object with recursively JSON-compatible values."""
+
+    prefix = "Persisted Response" if persisted else "Response"
+
+    if not isinstance(value, dict):
+        raise ResponsePersistenceError(
+            f"{prefix} {field} must be a JSON object, got {value!r}"
+        )
+
+    raw = cast(
+        dict[object, object],
         value,
     )
-    for key, item in mapping.items():
-        if not isinstance(
-            key,
-            str,
-        ):
-            raise ResponsePersistenceError(f"{field_name} keys must be text")
+
+    for key, item in raw.items():
+        if not isinstance(key, str):
+            raise ResponsePersistenceError(
+                f"{prefix} {field} must contain only string keys, got {key!r}"
+            )
 
         _validate_json_like(
             item,
-            field_name=f"{field_name}.{key}",
+            field=f"{field}.{key}",
+            prefix=prefix,
         )
 
 
 def _validate_json_like(
     value: object,
     *,
-    field_name: str,
+    field: str,
+    prefix: str,
 ) -> None:
-    """Require a recursively JSON-compatible value."""
+    """Require recursively JSON-compatible data."""
 
     if value is None:
         return
 
-    if isinstance(
-        value,
-        str,
-    ):
+    if isinstance(value, str | bool | int):
         return
 
-    if isinstance(
-        value,
-        bool,
-    ):
-        return
-
-    if isinstance(
-        value,
-        int,
-    ):
-        return
-
-    if isinstance(
-        value,
-        float,
-    ):
+    if isinstance(value, float):
         if not math.isfinite(value):
             raise ResponsePersistenceError(
-                f"{field_name} must contain JSON-compatible values"
+                f"{prefix} {field} must contain JSON-compatible values, got {value!r}"
             )
+
         return
 
-    if isinstance(
-        value,
-        Mapping,
-    ):
-        mapping = cast(
-            Mapping[object, object],
-            value,
-        )
-
-        for key, item in mapping.items():
-            if not isinstance(
-                key,
-                str,
-            ):
-                raise ResponsePersistenceError(f"{field_name} keys must be text")
-
-            _validate_json_like(
-                item,
-                field_name=f"{field_name}.{key}",
-            )
-        return
-
-    if isinstance(
-        value,
-        list,
-    ):
-        items = cast(
+    if isinstance(value, list):
+        raw_items = cast(
             list[object],
             value,
         )
 
-        for index, item in enumerate(items):
+        for index, item in enumerate(raw_items):
             _validate_json_like(
                 item,
-                field_name=f"{field_name}[{index}]",
+                field=f"{field}[{index}]",
+                prefix=prefix,
             )
+
         return
 
-    raise ResponsePersistenceError(f"{field_name} must contain JSON-compatible values")
+    if isinstance(value, dict):
+        raw = cast(
+            dict[object, object],
+            value,
+        )
+
+        for key, item in raw.items():
+            if not isinstance(key, str):
+                raise ResponsePersistenceError(
+                    f"{prefix} {field} JSON object must contain only "
+                    f"string keys, got {key!r}"
+                )
+
+            _validate_json_like(
+                item,
+                field=f"{field}.{key}",
+                prefix=prefix,
+            )
+
+        return
+
+    raise ResponsePersistenceError(
+        f"{prefix} {field} must contain JSON-compatible values, got {value!r}"
+    )

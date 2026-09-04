@@ -1,57 +1,68 @@
 """Core data models for mxm-dataio.
 
-This module defines the minimal and deterministic structures used to
-represent all external I/O interactions within the MXM ecosystem.
+mxm-dataio is a durable cache around costly external data acquisitions.
 
-Each interaction is represented by a three-level hierarchy:
+It records:
 
-    Session → Request → Response
+    Session
+        the source and cache context under which requests are made
 
-A Session groups multiple Requests under a common logical run
-(e.g., a daily data fetch, a broker connection, or a streaming
-subscription).  Each Request records the intent and parameters of an
-external call, while each Response captures the corresponding outcome.
+    Request
+        one occurrence of a logical external data question
 
-The models are dependency-light, serializable, and future-proof for
-asynchronous or streaming communication patterns.
+    Resolution
+        whether that request was satisfied by a newly acquired response
+        or by reusing an existing cached response
 
-Caching and volatility
-----------------------
-Requests and Responses now include optional caching metadata
-(`cache_mode`, `ttl_seconds`, `as_of_bucket`, `fetched_at`) which
-allow `DataIoSession` to distinguish between volatile and stable
-sources, control cache reuse policies, and persist provenance for
-every collected payload.  These fields are informational only; all
-policy logic lives in the runtime API layer.
+    Response
+        one actual reply acquired from the external source
+
+    AdapterResult
+        the exact payload bytes and operational result produced by the
+        source adapter
+
+Payload bytes themselves are persisted separately through PayloadStore and
+are identified by their SHA-256 checksum.
+
+DataIO deliberately does not interpret source data semantically. Parsing,
+normalization, dataset semantics, and MXM epistemic state belong to layers
+above mxm-dataio.
+
+Timestamps use the canonical MXM timestamp representation from mxm-types.
+Models do not acquire wall-clock time themselves; timestamps are supplied
+explicitly by the runtime that creates or updates the records.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import Enum
 
 from mxm.types import JSONLike, JSONMap, JSONObj
+from mxm.types.timestamps import TSNSScalar
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
 # --------------------------------------------------------------------------- #
 
 
-def _utcnow() -> datetime:
-    """Return the current UTC timestamp with explicit tzinfo."""
-    return datetime.now(tz=UTC)
-
-
 def _uuid() -> str:
     """Generate a unique identifier as a string."""
+
     return str(uuid.uuid4())
 
 
 def _json_dumps(data: JSONLike) -> str:
-    """Deterministically serialize a Python object to JSON."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """Deterministically serialize a JSON-compatible value."""
+
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -59,49 +70,50 @@ def _json_dumps(data: JSONLike) -> str:
 # --------------------------------------------------------------------------- #
 
 
-class SessionMode(str, Enum):
-    """Operational mode of a session."""
-
-    SYNC = "sync"
-    ASYNC = "async"
-    BATCH = "batch"
-
-
-class RequestMethod(str, Enum):
-    """Generalized method or verb for external I/O requests."""
-
-    GET = "GET"
-    POST = "POST"
-    SEND = "SEND"
-    SUBSCRIBE = "SUBSCRIBE"
-    COMMAND = "COMMAND"
-
-
 class CacheMode(str, Enum):
-    """Policy under which one request occurrence uses cached observations."""
+    """Policy governing reuse of previously acquired responses.
+
+    DEFAULT
+        Reuse the newest eligible cached response when one exists.
+        Otherwise acquire and persist a new response.
+
+    ONLY_IF_CACHED
+        Reuse the newest eligible cached response when one exists.
+        Otherwise fail without contacting the external source.
+
+    BYPASS
+        Do not consider cached responses. Always acquire and persist a new
+        response.
+    """
 
     DEFAULT = "default"
     ONLY_IF_CACHED = "only_if_cached"
     BYPASS = "bypass"
-    REVALIDATE = "revalidate"
-    NEVER = "never"
 
 
 class ResponseStatus(str, Enum):
-    """Canonical response status values."""
+    """Operational classification of an acquired external reply.
+
+    The source adapter assigns this classification.
+
+    OK
+        The external interaction produced a complete valid answer to the
+        logical request. DataIO does not interpret the semantic content of
+        that answer; a valid "no data" reply may therefore still be OK.
+
+    ERROR
+        The external interaction produced a reply that does not constitute a
+        valid reusable answer to the request.
+
+    Only OK responses are eligible for cache reuse.
+    """
 
     OK = "ok"
     ERROR = "error"
-    PARTIAL = "partial"
-    STREAM_OPEN = "stream_open"
-    STREAM_MESSAGE = "stream_message"
-    STREAM_CLOSED = "stream_closed"
-    ACK = "ack"
-    NACK = "nack"
 
 
 class ResolutionKind(str, Enum):
-    """How one request occurrence was satisfied."""
+    """How one Request occurrence was satisfied."""
 
     ACQUIRED = "acquired"
     REUSED = "reused"
@@ -114,71 +126,92 @@ class ResolutionKind(str, Enum):
 
 @dataclass(slots=True)
 class Session:
-    """Logical ingestion or I/O session grouping multiple requests."""
+    """Stable source and cache context for a group of Request occurrences.
+
+    ``source`` identifies the external source adapter namespace.
+
+    ``cache_mode`` determines whether previously acquired responses may or
+    must be reused.
+
+    ``ttl_seconds`` optionally limits the age of reusable responses.
+
+    ``as_of_bucket`` and ``cache_tag`` are opaque caller-supplied cache
+    partition coordinates. DataIO compares them for equality but assigns no
+    temporal, versioning, or domain semantics to them.
+
+    ``started_at`` and ``ended_at`` use the canonical MXM timestamp
+    representation. The runtime supplies these timestamps; Session does not
+    acquire wall-clock time itself.
+    """
 
     source: str
     cache_mode: CacheMode
-    mode: SessionMode = SessionMode.SYNC
+    started_at: TSNSScalar
 
     ttl_seconds: float | None = None
     as_of_bucket: str | None = None
     cache_tag: str | None = None
 
     id: str = field(default_factory=_uuid)
-    started_at: datetime = field(default_factory=_utcnow)
-    ended_at: datetime | None = None
+    ended_at: TSNSScalar | None = None
 
-    def end(self) -> None:
-        """Mark the session as completed."""
-        self.ended_at = _utcnow()
+    def end(self, *, ended_at: TSNSScalar) -> None:
+        """Mark the Session as completed at the supplied timestamp."""
 
-
-dataclass(frozen=True, slots=True)
+        self.ended_at = ended_at
 
 
 @dataclass(frozen=True, slots=True)
 class Request:
-    """One immutable occurrence of an external I/O question.
+    """One immutable occurrence of a logical external data question.
 
-    ``id`` identifies this individual request occurrence.
+    ``id`` identifies this individual Request occurrence.
 
-    ``session_id`` identifies the DataIO Session under whose source and
-    handling context the request was made.
+    ``session_id`` identifies the Session whose source and cache context apply
+    to this occurrence.
 
-    ``hash`` identifies the question itself. It is derived only from the
-    question-bearing fields: ``kind``, ``method``, ``params``, and ``body``.
+    ``kind`` identifies the logical vendor operation, for example
+    ``"databento.timeseries.get_range"``.
 
-    Session-owned context such as source, cache policy, TTL, as-of bucket,
-    and cache tag deliberately does not participate in this hash. Those values
-    are considered separately when DataIO determines whether an existing
-    observation is eligible for reuse.
+    ``params`` contains the canonical logical arguments to that operation.
+    Transport details such as HTTP method, query-string versus request-body
+    placement, SDK invocation shape, authentication, and pagination belong to
+    the source adapter and are deliberately absent from Request.
+
+    ``hash`` identifies the logical question itself. It is derived only from
+    ``kind`` and ``params``.
+
+    Session-owned context such as source, cache mode, TTL, as-of bucket, and
+    cache tag deliberately does not participate in the question hash. Those
+    values form the separate cache-reuse context.
+
+    ``created_at`` records when this Request occurrence was created. The
+    runtime supplies the timestamp.
     """
 
     session_id: str
     kind: str
+    created_at: TSNSScalar
 
-    method: RequestMethod = RequestMethod.GET
     params: JSONObj | None = None
-    body: JSONLike | None = None
 
     id: str = field(default_factory=_uuid)
-    created_at: datetime = field(default_factory=_utcnow)
     hash: str = field(init=False)
 
     def __post_init__(self) -> None:
-        """Compute the deterministic question identity."""
+        """Compute the deterministic logical-question identity."""
 
         base: JSONLike = {
             "kind": self.kind,
-            "method": self.method.value,
             "params": self.params,
-            "body": self.body,
         }
 
         object.__setattr__(
             self,
             "hash",
-            hashlib.sha256(_json_dumps(base).encode()).hexdigest(),
+            hashlib.sha256(
+                _json_dumps(base).encode(),
+            ).hexdigest(),
         )
 
 
@@ -188,60 +221,67 @@ class Resolution:
 
     ``request_id`` identifies the Request occurrence being resolved.
 
-    ``response_id`` identifies the external Response observation whose result
-    satisfied that Request.
+    ``response_id`` identifies the Response whose payload satisfied that
+    Request.
 
-    ``kind`` records whether that observation was newly acquired for this
-    Request or reused from an earlier acquisition.
+    ``kind`` records whether the Response was newly acquired for this Request
+    or reused from an earlier acquisition.
 
-    One Request occurrence has at most one final Resolution. Accordingly,
-    ``request_id`` is sufficient as the persistence identity; Resolution does
-    not require a separate generated ID.
+    One Request occurrence has at most one final Resolution, so ``request_id``
+    is sufficient as the persistence identity.
 
-    For an acquired Resolution, the referenced Response is produced by the
-    same Request occurrence.
+    For ACQUIRED:
 
-    For a reused Resolution, the referenced Response was produced by an
-    earlier Request occurrence and is reused without fabricating a new
-    external observation.
+        Response.request_id == Resolution.request_id
+
+    For REUSED:
+
+        Response.request_id != Resolution.request_id
+
+    ``resolved_at`` is supplied by the runtime.
     """
 
     request_id: str
     response_id: str
     kind: ResolutionKind
-
-    resolved_at: datetime = field(default_factory=_utcnow)
+    resolved_at: TSNSScalar
 
 
 @dataclass(frozen=True, slots=True)
 class Response:
-    """One immutable external response observation.
+    """One immutable reply actually acquired from an external source.
 
-    ``id`` identifies this external observation.
+    ``id`` identifies this individual external response occurrence.
 
-    ``request_id`` identifies the request occurrence that actually contacted
-    the external source and produced this observation.
+    ``request_id`` identifies the Request occurrence that actually contacted
+    the external source and acquired this Response.
 
-    ``payload_checksum`` identifies the exact payload bytes presented by the
-    external source at the adapter boundary. Distinct observations may
-    legitimately reference identical payload bytes and therefore share one
-    payload checksum.
+    ``status`` is the generic operational classification assigned by the
+    source adapter.
 
-    Optional metadata describes generic properties of the payload or
-    acquisition. Source- or transport-specific metadata belongs in
-    ``adapter_meta``.
+    ``payload_checksum`` identifies the exact payload bytes acquired at the
+    adapter boundary. Distinct Responses may legitimately reference the same
+    checksum when repeated external calls return byte-for-byte identical data.
+
+    ``fetched_at`` records when the external response was acquired. It carries
+    cache-freshness meaning.
+
+    ``created_at`` records when the Response record was created.
+
+    Both timestamps are supplied explicitly by the runtime.
+
+    Generic representation and acquisition metadata are represented directly.
+    Source- or protocol-specific facts remain opaque in ``adapter_meta``.
     """
 
     request_id: str
     status: ResponseStatus
     payload_checksum: str
     size_bytes: int
+    created_at: TSNSScalar
+    fetched_at: TSNSScalar
 
     id: str = field(default_factory=_uuid)
-    sequence: int | None = None
-
-    created_at: datetime = field(default_factory=_utcnow)
-    fetched_at: datetime = field(default_factory=_utcnow)
 
     media_type: str | None = None
     encoding: str | None = None
@@ -251,42 +291,42 @@ class Response:
     @classmethod
     def from_bytes(
         cls,
+        *,
         request_id: str,
         status: ResponseStatus,
         data: bytes,
-        sequence: int | None = None,
-    ) -> "Response":
-        """Create an observation from exact external payload bytes."""
+        created_at: TSNSScalar,
+        fetched_at: TSNSScalar,
+    ) -> Response:
+        """Create a Response from exact external payload bytes."""
 
         return cls(
             request_id=request_id,
             status=status,
             payload_checksum=hashlib.sha256(data).hexdigest(),
             size_bytes=len(data),
-            sequence=sequence,
+            created_at=created_at,
+            fetched_at=fetched_at,
         )
 
     @classmethod
     def from_adapter_result(
         cls,
+        *,
         request_id: str,
-        status: ResponseStatus,
-        result: "AdapterResult",
-        sequence: int | None = None,
-    ) -> "Response":
-        """Create an observation from an adapter result.
-
-        The payload checksum and size are derived from the exact bytes at the
-        adapter boundary. Generic acquisition metadata is copied onto the
-        observation; source-specific metadata remains opaque to DataIO.
-        """
+        result: AdapterResult,
+        created_at: TSNSScalar,
+        fetched_at: TSNSScalar,
+    ) -> Response:
+        """Create a Response from one source-adapter acquisition result."""
 
         return cls(
             request_id=request_id,
-            status=status,
+            status=result.status,
             payload_checksum=hashlib.sha256(result.data).hexdigest(),
             size_bytes=len(result.data),
-            sequence=sequence,
+            created_at=created_at,
+            fetched_at=fetched_at,
             media_type=result.media_type,
             encoding=result.encoding,
             elapsed_ms=result.elapsed_ms,
@@ -296,28 +336,29 @@ class Response:
         )
 
     def verify_payload(self, data: bytes) -> bool:
-        """Return whether bytes match this observation's payload identity."""
+        """Return whether bytes match this Response's payload identity."""
 
         return hashlib.sha256(data).hexdigest() == self.payload_checksum
 
 
 @dataclass(frozen=True, slots=True)
 class AdapterResult:
-    """Exact external payload plus generic acquisition metadata.
+    """Result of one actual external acquisition performed by an adapter.
 
-    ``data`` contains the exact payload bytes presented by the external source
-    at the adapter boundary. DataIO does not semantically transform these
-    bytes before deriving payload identity or persisting them.
+    ``status`` is the adapter's generic operational classification of the
+    external reply.
 
-    Generic metadata may describe the representation or acquisition where
-    applicable. Transport-, protocol-, device-, or source-specific facts
-    belong in ``adapter_meta``.
+    ``data`` contains the exact payload bytes presented to DataIO at the
+    adapter boundary. DataIO does not semantically transform these bytes before
+    deriving payload identity or persisting them.
 
-    Examples of adapter-specific metadata include HTTP status and headers,
-    filesystem path and inode, broker request IDs, Kafka offsets, or device
-    identifiers. DataIO assigns no semantics to those values.
+    Generic representation and acquisition metadata may be provided directly.
+
+    Source-, SDK-, or protocol-specific metadata belongs in ``adapter_meta``.
+    DataIO persists those values but assigns no semantics to them.
     """
 
+    status: ResponseStatus
     data: bytes
 
     media_type: str | None = None
@@ -326,10 +367,10 @@ class AdapterResult:
     adapter_meta: JSONObj | None = None
 
     def meta_dict(self) -> JSONMap:
-        """Return generic metadata as JSON for legacy persistence callers.
+        """Return generic metadata for legacy persistence callers.
 
-        This compatibility helper may be removed when the legacy filesystem
-        sidecar persistence path is retired.
+        This compatibility helper can be removed when the legacy DataIO runtime
+        and filesystem sidecar persistence path have been retired.
         """
 
         result: JSONMap = {}

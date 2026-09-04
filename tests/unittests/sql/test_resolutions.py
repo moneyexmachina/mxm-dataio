@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal, Self, cast
 
 import pytest
@@ -17,6 +17,12 @@ from mxm.dataio.sql.resolutions import (
     fetch_resolution_by_request_id,
     fetch_resolutions_by_response_id,
     insert_resolution,
+)
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_int,
+    ts_ns_from_str,
+    ts_ns_to_int,
 )
 
 type ExecutableQuery = sql.SQL | sql.Composed
@@ -57,8 +63,6 @@ class FakeCursor:
         self._executions = executions
 
     def __enter__(self) -> Self:
-        """Enter the fake cursor context."""
-
         return self
 
     def __exit__(
@@ -67,8 +71,8 @@ class FakeCursor:
         exc_value: object,
         traceback: object,
     ) -> None:
-        """Exit the fake cursor context."""
         _ = exc_type, exc_value, traceback
+        return None
 
     def execute(
         self,
@@ -111,8 +115,6 @@ class FakeConnection:
             )
 
     def cursor(self) -> FakeCursor:
-        """Return the next scripted cursor."""
-
         self.cursor_calls += 1
 
         if not self._cursors:
@@ -123,24 +125,42 @@ class FakeConnection:
         return self._cursors.pop(0)
 
     def commit(self) -> None:
-        """Record an unexpected commit request."""
-
         self.commit_calls += 1
 
     def rollback(self) -> None:
-        """Record an unexpected rollback request."""
-
         self.rollback_calls += 1
 
 
 def _as_connection(
     connection: FakeConnection,
 ) -> Connection[PostgresRow]:
-    """Cast a fake connection to the production connection type."""
-
     return cast(
         Connection[PostgresRow],
         connection,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Timestamp fixtures and boundary helpers
+# ---------------------------------------------------------------------------
+
+
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+_RESOLVED_AT = ts_ns_from_str("2026-09-03T10:30:00.123456000Z")
+
+
+def _db_datetime(
+    value: TSNSScalar,
+) -> datetime:
+    """Encode one microsecond-aligned MXM timestamp as fake Psycopg output."""
+
+    nanoseconds = ts_ns_to_int(value)
+
+    assert nanoseconds % 1_000 == 0
+
+    return _UNIX_EPOCH + timedelta(
+        microseconds=nanoseconds // 1_000,
     )
 
 
@@ -149,22 +169,12 @@ def _as_connection(
 # ---------------------------------------------------------------------------
 
 
-_RESOLVED_AT = datetime(
-    2026,
-    9,
-    3,
-    10,
-    30,
-    tzinfo=UTC,
-)
-
-
 def _resolution(
     *,
     request_id: str = "request-1",
     response_id: str = "response-1",
     kind: ResolutionKind = ResolutionKind.ACQUIRED,
-    resolved_at: datetime = _RESOLVED_AT,
+    resolved_at: TSNSScalar = _RESOLVED_AT,
 ) -> Resolution:
     """Construct one representative immutable Resolution."""
 
@@ -179,13 +189,13 @@ def _resolution(
 def _resolution_row(
     resolution: Resolution,
 ) -> PostgresRow:
-    """Encode one Resolution as a PostgreSQL result row."""
+    """Encode one Resolution as a fake Psycopg PostgreSQL result row."""
 
     return (
         resolution.request_id,
         resolution.response_id,
         resolution.kind.value,
-        resolution.resolved_at,
+        _db_datetime(resolution.resolved_at),
     )
 
 
@@ -197,11 +207,7 @@ def _resolution_row(
 def _row(
     *values: object,
 ) -> PostgresRow:
-    """Construct an arbitrary PostgreSQL result row."""
-
-    return tuple(
-        values,
-    )
+    return tuple(values)
 
 
 def _row_with_value(
@@ -209,11 +215,7 @@ def _row_with_value(
     index: int,
     value: object,
 ) -> PostgresRow:
-    """Return a PostgreSQL row with one value replaced."""
-
-    values = list(
-        row,
-    )
+    values = list(row)
 
     if index < 0 or index >= len(values):
         raise AssertionError(
@@ -231,18 +233,13 @@ def _row_with_value(
 def _query_text(
     query: ExecutableQuery,
 ) -> str:
-    """Render and normalise one composed SQL query."""
-
     return " ".join(query.as_string().split())
 
 
 def _single_execution(
     connection: FakeConnection,
 ) -> Execution:
-    """Return the sole recorded SQL operation."""
-
     assert len(connection.executions) == 1
-
     return connection.executions[0]
 
 
@@ -306,6 +303,89 @@ def test_fetch_resolution_by_request_id_reconstructs_resolution() -> None:
     assert resolution == expected
 
 
+def test_fetch_resolution_by_request_id_converts_database_timestamp_to_mxm_timestamp() -> (
+    None
+):
+    """Psycopg datetime reconstructs as the canonical MXM timestamp."""
+
+    expected = _resolution()
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    _resolution_row(
+                        expected,
+                    ),
+                ]
+            ),
+        ]
+    )
+
+    resolution = fetch_resolution_by_request_id(
+        _as_connection(
+            connection,
+        ),
+        schema="dataio_test_abc",
+        request_id=expected.request_id,
+    )
+
+    assert resolution is not None
+    assert resolution.resolved_at == expected.resolved_at
+
+
+def test_fetch_resolution_by_request_id_normalises_aware_database_timestamp_to_utc() -> (
+    None
+):
+    """Equivalent aware database timestamps reconstruct to one instant."""
+
+    expected = _resolution(
+        resolved_at=ts_ns_from_str("2026-09-03T10:30:00.000000000Z"),
+    )
+
+    row = _resolution_row(
+        expected,
+    )
+
+    utc_plus_one = timezone(
+        timedelta(hours=1),
+    )
+
+    row = _row_with_value(
+        row,
+        3,
+        datetime(
+            2026,
+            9,
+            3,
+            11,
+            30,
+            tzinfo=utc_plus_one,
+        ),
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    row,
+                ]
+            ),
+        ]
+    )
+
+    resolution = fetch_resolution_by_request_id(
+        _as_connection(
+            connection,
+        ),
+        schema="dataio_test_abc",
+        request_id=expected.request_id,
+    )
+
+    assert resolution is not None
+    assert resolution.resolved_at == expected.resolved_at
+
+
 def test_fetch_resolution_by_request_id_uses_schema_and_request_identity() -> None:
     """Resolution lookup uses the configured schema and Request ID."""
 
@@ -328,6 +408,7 @@ def test_fetch_resolution_by_request_id_uses_schema_and_request_identity() -> No
     execution = _single_execution(
         connection,
     )
+
     query_text = _query_text(
         execution.query,
     )
@@ -392,7 +473,9 @@ def test_fetch_resolution_by_request_id_rejects_multiple_rows() -> None:
         )
 
 
-_RESOLUTION_ROW = _resolution_row(_resolution())
+_RESOLUTION_ROW = _resolution_row(
+    _resolution(),
+)
 
 
 @pytest.mark.parametrize(
@@ -482,7 +565,7 @@ def test_fetch_resolution_by_request_id_rejects_invalid_rows(
     row: PostgresRow,
     error_match: str,
 ) -> None:
-    """Malformed persisted Resolution rows cannot enter the domain."""
+    """Malformed persisted Resolution rows cannot enter the model."""
 
     connection = FakeConnection(
         [
@@ -541,28 +624,14 @@ def test_fetch_resolutions_by_response_id_preserves_multiple_requests() -> None:
         request_id="request-1",
         response_id="response-1",
         kind=ResolutionKind.ACQUIRED,
-        resolved_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            0,
-            tzinfo=UTC,
-        ),
+        resolved_at=ts_ns_from_str("2026-09-03T10:00:00.000000000Z"),
     )
 
     reused = _resolution(
         request_id="request-2",
         response_id="response-1",
         kind=ResolutionKind.REUSED,
-        resolved_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            5,
-            tzinfo=UTC,
-        ),
+        resolved_at=ts_ns_from_str("2026-09-03T10:05:00.000000000Z"),
     )
 
     connection = FakeConnection(
@@ -595,7 +664,7 @@ def test_fetch_resolutions_by_response_id_preserves_multiple_requests() -> None:
 
 
 def test_fetch_resolutions_by_response_id_uses_filter_and_ordering() -> None:
-    """Response lookup uses response identity and deterministic ordering."""
+    """Response lookup uses Response identity and deterministic ordering."""
 
     connection = FakeConnection(
         [
@@ -616,6 +685,7 @@ def test_fetch_resolutions_by_response_id_uses_filter_and_ordering() -> None:
     execution = _single_execution(
         connection,
     )
+
     query_text = _query_text(
         execution.query,
     )
@@ -685,7 +755,7 @@ def test_fetch_resolutions_by_response_id_rejects_duplicate_request_identity() -
 
 
 def test_insert_acquired_resolution_encodes_complete_state() -> None:
-    """An acquired Resolution references a Response acquired by the same Q."""
+    """ACQUIRED references a Response acquired by the same Request."""
 
     resolution = _resolution(
         request_id="request-1",
@@ -741,16 +811,19 @@ def test_insert_acquired_resolution_encodes_complete_state() -> None:
 
     assert '"dataio_test_abc"."resolutions"' in insert_query
     assert "ON CONFLICT (request_id) DO NOTHING" in insert_query
+
     assert insert_execution.parameters == (
         resolution.request_id,
         resolution.response_id,
         resolution.kind.value,
-        resolution.resolved_at,
+        _db_datetime(
+            resolution.resolved_at,
+        ),
     )
 
 
 def test_insert_acquired_resolution_rejects_response_from_different_request() -> None:
-    """ACQUIRED cannot claim another Request occurrence's observation."""
+    """ACQUIRED cannot claim another Request occurrence's Response."""
 
     resolution = _resolution(
         request_id="request-2",
@@ -833,7 +906,9 @@ def test_insert_reused_resolution_accepts_existing_external_observation() -> Non
         "request-2",
         "response-1",
         ResolutionKind.REUSED.value,
-        resolution.resolved_at,
+        _db_datetime(
+            resolution.resolved_at,
+        ),
     )
 
 
@@ -877,7 +952,7 @@ def test_insert_reused_resolution_rejects_response_from_same_request() -> None:
 
 
 def test_insert_resolution_rejects_missing_response() -> None:
-    """A Resolution cannot reference an observation that is not persisted."""
+    """A Resolution cannot reference a Response that is not persisted."""
 
     resolution = _resolution()
 
@@ -928,7 +1003,7 @@ def test_insert_resolution_rejects_missing_response() -> None:
 def test_insert_resolution_rejects_invalid_response_lookup_result(
     rows: list[PostgresRow],
 ) -> None:
-    """Malformed Response relationship state is rejected before insertion."""
+    """Malformed Response acquisition provenance is rejected."""
 
     resolution = _resolution()
 
@@ -995,16 +1070,18 @@ def test_insert_resolution_accepts_matching_persisted_state() -> None:
     assert "SELECT request_id" in _query_text(
         connection.executions[0].query,
     )
+
     assert "INSERT INTO" in _query_text(
         connection.executions[1].query,
     )
+
     assert "SELECT" in _query_text(
         connection.executions[2].query,
     )
 
 
 def test_insert_resolution_rejects_conflicting_persisted_state() -> None:
-    """One Request occurrence cannot acquire two different final Resolutions."""
+    """One Request occurrence cannot have two different final Resolutions."""
 
     requested = _resolution(
         response_id="response-1",
@@ -1036,7 +1113,7 @@ def test_insert_resolution_rejects_conflicting_persisted_state() -> None:
 
     with pytest.raises(
         ResolutionConflictError,
-        match=r"Persisted resolution conflicts.*request-1",
+        match=r"Persisted Resolution conflicts.*request-1",
     ):
         insert_resolution(
             _as_connection(
@@ -1102,18 +1179,6 @@ def test_insert_resolution_rejects_missing_state_after_insert() -> None:
             ),
             r"response_id must be non-empty text",
         ),
-        (
-            _resolution(
-                resolved_at=datetime(
-                    2026,
-                    9,
-                    3,
-                    10,
-                    30,
-                ),
-            ),
-            r"resolved_at must be timezone-aware",
-        ),
     ],
 )
 def test_insert_resolution_rejects_invalid_state_before_sql(
@@ -1138,6 +1203,63 @@ def test_insert_resolution_rejects_invalid_state_before_sql(
 
     assert connection.cursor_calls == 0
     assert connection.executions == []
+
+
+def test_insert_resolution_rejects_noncanonical_timestamp_before_sql() -> None:
+    """Resolution timestamps must use the canonical MXM representation."""
+
+    invalid_timestamp = cast(
+        TSNSScalar,
+        "2026-09-03T10:30:00Z",
+    )
+
+    resolution = _resolution(
+        resolved_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResolutionPersistenceError,
+        match=r"resolved_at must be a valid canonical MXM timestamp",
+    ):
+        insert_resolution(
+            _as_connection(
+                connection,
+            ),
+            schema="dataio_test_abc",
+            resolution=resolution,
+        )
+
+    assert connection.cursor_calls == 0
+
+
+def test_insert_resolution_rejects_non_microsecond_aligned_timestamp() -> None:
+    """Persistence never silently truncates Resolution nanoseconds."""
+
+    invalid_timestamp = ts_ns_from_int(
+        ts_ns_to_int(_RESOLVED_AT) + 1,
+    )
+
+    resolution = _resolution(
+        resolved_at=invalid_timestamp,
+    )
+
+    connection = FakeConnection()
+
+    with pytest.raises(
+        ResolutionPersistenceError,
+        match=r"resolved_at cannot be represented exactly.*microsecond precision",
+    ):
+        insert_resolution(
+            _as_connection(
+                connection,
+            ),
+            schema="dataio_test_abc",
+            resolution=resolution,
+        )
+
+    assert connection.cursor_calls == 0
 
 
 # ---------------------------------------------------------------------------

@@ -1,19 +1,25 @@
-"""PostgreSQL integration tests for DataIO request SQL/schema compatibility.
+"""PostgreSQL integration tests for DataIO Request persistence.
 
-These tests exercise the real migrated PostgreSQL schema. They prove that the
-request SQL adapter matches that schema, that multiple request occurrences may
-share one question hash across different Sessions, that Session membership is
-relationally enforced, and that request JSON and conflict semantics behave
-correctly through real PostgreSQL.
+These tests exercise the real migrated PostgreSQL schema and Psycopg boundary.
 
-Detailed SQL construction, row validation, question-identity computation, and
-transaction non-ownership are tested separately by the request unit tests.
+They prove that:
+
+- complete Request state round-trips through PostgreSQL;
+- multiple Request occurrences may share one logical-question hash across
+  different Sessions;
+- Session membership is relationally enforced;
+- Request JSON params survive PostgreSQL JSONB persistence;
+- Request identity is idempotent while conflicting occurrence state is rejected;
+- canonical MXM timestamps survive the real PostgreSQL timestamp boundary.
+
+Detailed SQL construction, malformed-row handling, logical-question hash
+validation, timestamp-boundary validation, and transaction non-ownership are
+tested separately by the Request unit tests.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
 
 import pytest
 from psycopg.errors import ForeignKeyViolation
@@ -21,9 +27,7 @@ from psycopg.errors import ForeignKeyViolation
 from mxm.dataio.models import (
     CacheMode,
     Request,
-    RequestMethod,
     Session,
-    SessionMode,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import (
@@ -33,7 +37,11 @@ from mxm.dataio.sql.requests import (
     insert_request,
 )
 from mxm.dataio.sql.sessions import insert_session
-from mxm.types import JSONLike, JSONObj
+from mxm.types import JSONObj
+from mxm.types.timestamps import (
+    TSNSScalar,
+    ts_ns_from_str,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -43,11 +51,10 @@ def _session(
     session_id: str,
     source: str = "test-source",
     cache_mode: CacheMode = CacheMode.DEFAULT,
-    mode: SessionMode = SessionMode.SYNC,
     ttl_seconds: float | None = 300.0,
     as_of_bucket: str | None = None,
     cache_tag: str | None = None,
-    started_at: datetime | None = None,
+    started_at: TSNSScalar | None = None,
 ) -> Session:
     """Construct one deterministic parent DataIO Session."""
 
@@ -55,21 +62,13 @@ def _session(
         id=session_id,
         source=source,
         cache_mode=cache_mode,
-        mode=mode,
         ttl_seconds=ttl_seconds,
         as_of_bucket=as_of_bucket,
         cache_tag=cache_tag,
         started_at=(
             started_at
             if started_at is not None
-            else datetime(
-                2026,
-                9,
-                3,
-                10,
-                0,
-                tzinfo=UTC,
-            )
+            else ts_ns_from_str("2026-09-03T10:00:00.123456000Z")
         ),
     )
 
@@ -79,31 +78,20 @@ def _request(
     request_id: str,
     session_id: str,
     kind: str = "prices",
-    method: RequestMethod = RequestMethod.GET,
     params: JSONObj | None = None,
-    body: JSONLike | None = None,
-    created_at: datetime | None = None,
+    created_at: TSNSScalar | None = None,
 ) -> Request:
-    """Construct one deterministic request occurrence."""
+    """Construct one deterministic Request occurrence."""
 
     return Request(
         id=request_id,
         session_id=session_id,
         kind=kind,
-        method=method,
         params=params,
-        body=body,
         created_at=(
             created_at
             if created_at is not None
-            else datetime(
-                2026,
-                9,
-                3,
-                10,
-                5,
-                tzinfo=UTC,
-            )
+            else ts_ns_from_str("2026-09-03T10:05:00.654321000Z")
         ),
     )
 
@@ -118,28 +106,28 @@ def test_requests_round_trip_through_postgres(
     session = _session(
         session_id="session-round-trip",
         source="example-source",
-        cache_mode=CacheMode.REVALIDATE,
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03T10",
         cache_tag="vendor-v1",
+        started_at=ts_ns_from_str("2026-09-03T10:00:00.123456000Z"),
     )
 
     request = _request(
         request_id="request-round-trip",
         session_id=session.id,
-        method=RequestMethod.POST,
+        kind="databento.timeseries.get_range",
         params={
             "symbol": "ES",
             "fields": [
                 "open",
                 "close",
             ],
-        },
-        body={
             "options": {
                 "adjusted": False,
             },
         },
+        created_at=ts_ns_from_str("2026-09-03T10:05:00.654321000Z"),
     )
 
     with database.transaction() as connection:
@@ -175,7 +163,7 @@ def test_requests_round_trip_through_postgres(
 def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The same question may occur independently in different Session contexts."""
+    """The same logical question may occur independently in different Sessions."""
 
     database = migrated_postgres_database
 
@@ -200,14 +188,7 @@ def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     first = _request(
         request_id="request-1",
         session_id=first_session.id,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            5,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T10:05:00.000000000Z"),
         params={
             "symbol": "ES",
         },
@@ -216,14 +197,7 @@ def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     second = _request(
         request_id="request-2",
         session_id=second_session.id,
-        created_at=datetime(
-            2026,
-            9,
-            3,
-            10,
-            6,
-            tzinfo=UTC,
-        ),
+        created_at=ts_ns_from_str("2026-09-03T10:06:00.000000000Z"),
         params={
             "symbol": "ES",
         },
@@ -351,7 +325,7 @@ def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     with pytest.raises(
         RequestConflictError,
-        match=r"Persisted request conflicts.*request-stable-identity",
+        match=r"Persisted Request conflicts.*request-stable-identity",
     ):
         with database.transaction() as connection:
             insert_request(
@@ -373,7 +347,7 @@ def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
 def test_request_json_round_trips_through_postgres(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """Nested question JSON survives Psycopg/PostgreSQL JSONB round-tripping."""
+    """Nested logical Request params survive PostgreSQL JSONB round-tripping."""
 
     database = migrated_postgres_database
 
@@ -396,8 +370,6 @@ def test_request_json_round_trips_through_postgres(
                 "adjusted": False,
                 "limit": 10,
             },
-        },
-        body={
             "nested": [
                 1,
                 "two",
@@ -433,4 +405,3 @@ def test_request_json_round_trips_through_postgres(
     assert persisted_request == request
     assert persisted_request is not None
     assert persisted_request.params == request.params
-    assert persisted_request.body == request.body
