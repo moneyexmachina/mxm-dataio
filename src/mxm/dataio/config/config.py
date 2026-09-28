@@ -1,27 +1,17 @@
 """
-Config access helpers for mxm-dataio.
+Configuration view helpers for mxm-dataio.
 
-This module provides **focused, read-only views** over the package's config
-subtrees, built on top of `mxm_config.make_view`. It intentionally performs
-no I/O at import time—callers should obtain a global `MXMConfig` via
-`mxm_config.load_config(...)` and then pass that object to the helpers here.
+mxm-dataio does not resolve runtime configuration itself. Callers provide an
+already-resolved MXMConfig, normally from RuntimeContext.config, and this
+module exposes focused read-only views over DataIO-owned configuration.
 
-Typical usage
--------------
-    from mxm.config import load_config
-    from mxm.dataio.config import dataio_view, dataio_paths_view, dataio_http_view
+Typical composition
+-------------------
+    context = resolve_runtime_context(identity)
+    cfg = dataio_view(context.config)
 
-    cfg = load_config(package="mxm-dataio", env="dev", profile="default")
-    dio = dataio_view(cfg)               # mxm_dataio subtree (read-only)
-
-Notes
------
-- These helpers **require** the new config shape with a package subtree:
-      mxm_dataio: { paths: {...}, http: {...}, ... }
-- Views are **read-only** and may be `resolve=True` for convenience at the
-  boundary. If you need to mutate derived parameters, convert to a plain dict:
-      from omegaconf import OmegaConf
-      params = OmegaConf.to_container(dataio_http_view(cfg), resolve=True)
+The origin, layering, environment selection, and runtime resolution of the
+configuration are outside mxm-dataio's responsibility.
 """
 
 from __future__ import annotations
