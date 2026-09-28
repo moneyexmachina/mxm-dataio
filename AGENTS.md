@@ -5,24 +5,38 @@ This file contains durable instructions for engineering agents working in
 in the task or Mission plan, not here.
 
 ## MXM engineering policy
+
+### Configuration and secrets
+
+MXM does not use environment variables or `.env` files for application
+configuration or secrets unless explicitly required by an external tool that
+cannot be integrated otherwise.
+
+Do not introduce environment-variable configuration, `.env` files, or
+`.env.example` files as an application configuration mechanism.
+
+Application configuration is provided through the MXM configuration and runtime
+composition system. Secrets and credentials are supplied through the MXM
+secrets and workload-identity mechanisms.
+
+If configuration or credentials required by a change are not available through
+those mechanisms, treat that as an architectural or integration issue rather
+than adding an environment-variable fallback.
+
 ### Python environment
 
 MXM Python repositories use Poetry with a project-local `.venv/`.
 
-Install the project and its dependencies with:
+Before running project Python, tests, validation, or other project tooling,
+ensure the project and its dependencies are installed:
 
     poetry install
+
+Do not assume that an existing `.venv/` is present or usable.
 
 Do not use or depend on Python packages installed in the host environment.
 Run Python and project Python tooling through Poetry or through repository
 `make` targets.
-
-Examples:
-
-    poetry run python ...
-    poetry run pytest ...
-
-Prefer repository `make` targets where an appropriate target exists.
 
 ### Validation
 
