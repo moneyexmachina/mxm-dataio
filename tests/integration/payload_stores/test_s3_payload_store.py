@@ -22,8 +22,9 @@ intended to run first against Hetzner Object Storage.
 from __future__ import annotations
 
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import boto3
