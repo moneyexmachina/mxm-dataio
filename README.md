@@ -102,12 +102,6 @@ class ExampleFetcher:
 
     def fetch(self, request: Request) -> AdapterResult:
         ...
-
-    def describe(self) -> str:
-        return self.source
-
-    def close(self) -> None:
-        pass
 ```
 
 ## Caching and Provenance
