@@ -32,7 +32,6 @@ from mxm.dataio.models import (
     ResolutionKind,
     Response,
     ResponseStatus,
-    Session,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import insert_request
@@ -44,7 +43,6 @@ from mxm.dataio.sql.resolutions import (
     insert_resolution,
 )
 from mxm.dataio.sql.responses import insert_response
-from mxm.dataio.sql.sessions import insert_session
 from mxm.types.timestamps import (
     TSNSScalar,
     ts_ns_from_str,
@@ -68,39 +66,20 @@ def _checksum(
     ).hexdigest()
 
 
-def _session(
-    *,
-    session_id: str,
-    source: str = "test-source",
-    cache_mode: CacheMode = CacheMode.DEFAULT,
-    started_at: TSNSScalar | None = None,
-) -> Session:
-    """Construct one deterministic parent DataIO Session."""
-
-    return Session(
-        id=session_id,
-        source=source,
-        cache_mode=cache_mode,
-        started_at=(
-            started_at
-            if started_at is not None
-            else ts_ns_from_str("2026-09-03T10:00:00.123456000Z")
-        ),
-    )
-
-
 def _request(
     *,
     request_id: str,
-    session_id: str,
+    source: str = "test-source",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one deterministic Request occurrence."""
 
     return Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind="prices",
+        cache_mode=cache_mode,
         params={
             "symbol": "ES",
         },
@@ -169,19 +148,12 @@ def _resolution(
 def _insert_acquired_observation(
     database: PostgresDatabase,
     *,
-    session: Session,
     request: Request,
     response: Response,
 ) -> None:
-    """Persist one Session → Request → Response acquisition hierarchy."""
+    """Persist one Request → Response acquisition hierarchy."""
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -207,13 +179,8 @@ def test_acquired_resolution_round_trips_through_postgres(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-acquired",
-    )
-
     request = _request(
         request_id="request-acquired",
-        session_id=session.id,
     )
 
     response = _response(
@@ -231,7 +198,6 @@ def test_acquired_resolution_round_trips_through_postgres(
 
     _insert_acquired_observation(
         database,
-        session=session,
         request=request,
         response=response,
     )
@@ -272,15 +238,10 @@ def test_reused_resolution_references_existing_observation(
 
     database = migrated_postgres_database
 
-    acquiring_session = _session(
-        session_id="session-acquiring",
-        source="source-a",
-        cache_mode=CacheMode.DEFAULT,
-    )
-
     acquiring_request = _request(
         request_id="request-1",
-        session_id=acquiring_session.id,
+        source="source-a",
+        cache_mode=CacheMode.DEFAULT,
         created_at=ts_ns_from_str("2026-09-03T10:01:00.000000000Z"),
     )
 
@@ -292,16 +253,10 @@ def test_reused_resolution_references_existing_observation(
         fetched_at=ts_ns_from_str("2026-09-03T10:02:01.000000000Z"),
     )
 
-    reusing_session = _session(
-        session_id="session-reusing",
-        source="source-a",
-        cache_mode=CacheMode.ONLY_IF_CACHED,
-        started_at=ts_ns_from_str("2026-09-03T10:04:00.000000000Z"),
-    )
-
     reusing_request = _request(
         request_id="request-2",
-        session_id=reusing_session.id,
+        source="source-a",
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         created_at=ts_ns_from_str("2026-09-03T10:05:00.000000000Z"),
     )
 
@@ -324,18 +279,6 @@ def test_reused_resolution_references_existing_observation(
     assert response.request_id != reusing_request.id
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=acquiring_session,
-        )
-
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=reusing_session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -406,18 +349,12 @@ def test_acquired_resolution_rejects_observation_from_different_request(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-invalid-acquired",
-    )
-
     first_request = _request(
         request_id="request-1",
-        session_id=session.id,
     )
 
     second_request = _request(
         request_id="request-2",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-03T10:01:01.000000000Z"),
     )
 
@@ -433,12 +370,6 @@ def test_acquired_resolution_rejects_observation_from_different_request(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -485,13 +416,8 @@ def test_reused_resolution_rejects_observation_from_same_request(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-invalid-reused",
-    )
-
     request = _request(
         request_id="request-1",
-        session_id=session.id,
     )
 
     response = _response(
@@ -507,7 +433,6 @@ def test_reused_resolution_rejects_observation_from_same_request(
 
     _insert_acquired_observation(
         database,
-        session=session,
         request=request,
         response=response,
     )
@@ -545,13 +470,8 @@ def test_resolution_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-resolution-conflict",
-    )
-
     request = _request(
         request_id="request-resolution-conflict",
-        session_id=session.id,
     )
 
     first_response = _response(
@@ -575,12 +495,6 @@ def test_resolution_persistence_is_idempotent_and_rejects_identity_conflicts(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -646,13 +560,8 @@ def test_resolution_request_foreign_key_is_enforced(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-resolution-fk",
-    )
-
     acquiring_request = _request(
         request_id="request-acquiring",
-        session_id=session.id,
     )
 
     response = _response(
@@ -662,7 +571,6 @@ def test_resolution_request_foreign_key_is_enforced(
 
     _insert_acquired_observation(
         database,
-        session=session,
         request=acquiring_request,
         response=response,
     )

@@ -10,7 +10,7 @@ import pytest
 from psycopg import Connection, sql
 from psycopg.types.json import Jsonb
 
-from mxm.dataio.models import Request
+from mxm.dataio.models import CacheMode, Request
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.requests import (
     RequestConflictError,
@@ -172,18 +172,26 @@ def _db_datetime(
 def _request(
     *,
     request_id: str = "request-1",
-    session_id: str = "session-1",
+    source: str = "source-a",
     kind: str = "prices",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     params: JSONObj | None = None,
+    ttl_seconds: float | None = 60.0,
+    as_of_bucket: str | None = "bucket-a",
+    cache_tag: str | None = "vendor-v1",
     created_at: TSNSScalar = _CREATED_AT,
 ) -> Request:
     """Construct one representative immutable Request occurrence."""
 
     return Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind=kind,
+        cache_mode=cache_mode,
         params=params,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=created_at,
     )
 
@@ -195,9 +203,13 @@ def _request_row(
 
     return (
         request.id,
-        request.session_id,
+        request.source,
         request.kind,
         request.params,
+        request.cache_mode.value,
+        request.ttl_seconds,
+        request.as_of_bucket,
+        request.cache_tag,
         request.hash,
         _db_datetime(request.created_at),
     )
@@ -269,7 +281,7 @@ def test_request_occurrences_can_share_question_identity() -> None:
 
     first = _request(
         request_id="request-1",
-        session_id="session-1",
+        source="source-a",
         params={
             "symbol": "ES",
         },
@@ -277,14 +289,14 @@ def test_request_occurrences_can_share_question_identity() -> None:
 
     second = _request(
         request_id="request-2",
-        session_id="session-2",
+        source="source-b",
         params={
             "symbol": "ES",
         },
     )
 
     assert first.id != second.id
-    assert first.session_id != second.session_id
+    assert first.source != second.source
     assert first.hash == second.hash
 
 
@@ -293,7 +305,14 @@ def test_request_occurrences_can_share_question_identity() -> None:
     [
         _request(
             request_id="request-2",
-            session_id="different-session",
+            source="different-source",
+        ),
+        _request(
+            request_id="request-2",
+            cache_mode=CacheMode.ONLY_IF_CACHED,
+            ttl_seconds=3_600.0,
+            as_of_bucket="bucket-b",
+            cache_tag="vendor-v2",
         ),
         _request(
             request_id="request-2",
@@ -301,10 +320,10 @@ def test_request_occurrences_can_share_question_identity() -> None:
         ),
     ],
 )
-def test_occurrence_metadata_does_not_change_question_hash(
+def test_occurrence_and_resolution_context_does_not_change_question_hash(
     second: Request,
 ) -> None:
-    """Occurrence identity and timing do not participate in question identity."""
+    """Occurrence and resolution context do not participate in question identity."""
 
     first = _request(
         request_id="request-1",
@@ -430,7 +449,7 @@ def test_fetch_request_by_id_normalises_aware_database_timestamp_to_utc() -> Non
 
     row = _row_with_value(
         row,
-        5,
+        9,
         datetime(
             2026,
             9,
@@ -552,7 +571,7 @@ _REQUEST_ROW = _request_row(_request())
                 1,
                 123,
             ),
-            r"session_id must be non-empty text",
+            r"source must be non-empty text",
         ),
         (
             _row_with_value(
@@ -574,6 +593,38 @@ _REQUEST_ROW = _request_row(_request())
             _row_with_value(
                 _REQUEST_ROW,
                 4,
+                "future-mode",
+            ),
+            r"cache_mode is not recognised",
+        ),
+        (
+            _row_with_value(
+                _REQUEST_ROW,
+                5,
+                -1.0,
+            ),
+            r"ttl_seconds must be a finite non-negative number or NULL",
+        ),
+        (
+            _row_with_value(
+                _REQUEST_ROW,
+                6,
+                123,
+            ),
+            r"as_of_bucket must be text or NULL",
+        ),
+        (
+            _row_with_value(
+                _REQUEST_ROW,
+                7,
+                123,
+            ),
+            r"cache_tag must be text or NULL",
+        ),
+        (
+            _row_with_value(
+                _REQUEST_ROW,
+                8,
                 "not-a-hash",
             ),
             r"64-character lowercase hexadecimal",
@@ -581,7 +632,7 @@ _REQUEST_ROW = _request_row(_request())
         (
             _row_with_value(
                 _REQUEST_ROW,
-                5,
+                9,
                 "2026-09-03T10:00:00Z",
             ),
             r"created_at must be a datetime",
@@ -589,7 +640,7 @@ _REQUEST_ROW = _request_row(_request())
         (
             _row_with_value(
                 _REQUEST_ROW,
-                5,
+                9,
                 datetime(
                     2026,
                     9,
@@ -630,7 +681,7 @@ def test_fetch_request_by_id_rejects_hash_inconsistent_with_question() -> None:
 
     row = _row_with_value(
         _REQUEST_ROW,
-        4,
+        8,
         "0" * 64,
     )
 
@@ -674,10 +725,10 @@ def test_fetch_requests_by_hash_returns_empty_mapping() -> None:
     assert requests == {}
 
 
-def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
+def test_fetch_requests_by_hash_preserves_occurrences_across_contexts() -> None:
     first = _request(
         request_id="request-1",
-        session_id="session-1",
+        source="source-a",
         params={
             "symbol": "ES",
         },
@@ -686,7 +737,7 @@ def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
 
     second = _request(
         request_id="request-2",
-        session_id="session-2",
+        source="source-b",
         params={
             "symbol": "ES",
         },
@@ -695,7 +746,7 @@ def test_fetch_requests_by_hash_preserves_occurrences_across_sessions() -> None:
 
     assert first.hash == second.hash
     assert first.id != second.id
-    assert first.session_id != second.session_id
+    assert first.source != second.source
 
     connection = FakeConnection(
         [
@@ -793,6 +844,8 @@ def test_fetch_requests_by_hash_rejects_duplicate_occurrence_identity() -> None:
 
 def test_insert_request_encodes_complete_request_state() -> None:
     request = _request(
+        source="source-complete",
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         params={
             "symbol": "TEST",
             "limit": 10,
@@ -800,6 +853,9 @@ def test_insert_request_encodes_complete_request_state() -> None:
                 "venue": "CME",
             },
         },
+        ttl_seconds=120.5,
+        as_of_bucket="bucket-complete",
+        cache_tag="vendor-v2",
     )
 
     connection = FakeConnection(
@@ -828,10 +884,10 @@ def test_insert_request_encodes_complete_request_state() -> None:
 
     parameters = _execution_parameters(execution)
 
-    assert len(parameters) == 6
+    assert len(parameters) == 10
 
     assert parameters[0] == request.id
-    assert parameters[1] == request.session_id
+    assert parameters[1] == request.source
     assert parameters[2] == request.kind
 
     params_json = parameters[3]
@@ -842,13 +898,20 @@ def test_insert_request_encodes_complete_request_state() -> None:
     )
     assert params_json.obj == request.params
 
-    assert parameters[4] == request.hash
-    assert parameters[5] == _db_datetime(request.created_at)
+    assert parameters[4] == request.cache_mode.value
+    assert parameters[5] == request.ttl_seconds
+    assert parameters[6] == request.as_of_bucket
+    assert parameters[7] == request.cache_tag
+    assert parameters[8] == request.hash
+    assert parameters[9] == _db_datetime(request.created_at)
 
 
 def test_insert_request_encodes_absent_params_as_null() -> None:
     request = _request(
         params=None,
+        ttl_seconds=None,
+        as_of_bucket=None,
+        cache_tag=None,
     )
 
     connection = FakeConnection(
@@ -871,6 +934,38 @@ def test_insert_request_encodes_absent_params_as_null() -> None:
     parameters = _execution_parameters(connection.executions[0])
 
     assert parameters[3] is None
+    assert parameters[5:8] == (None, None, None)
+
+
+def test_insert_request_preserves_zero_ttl_and_empty_partition_text() -> None:
+    """Former Session fields retain their existing permissive boundaries."""
+
+    request = _request(
+        ttl_seconds=0.0,
+        as_of_bucket="",
+        cache_tag="",
+    )
+
+    connection = FakeConnection(
+        [
+            FakeCursor(),
+            FakeCursor(
+                rows=[
+                    _request_row(request),
+                ]
+            ),
+        ]
+    )
+
+    insert_request(
+        _as_connection(connection),
+        schema="dataio_test_abc",
+        request=request,
+    )
+
+    parameters = _execution_parameters(connection.executions[0])
+
+    assert parameters[5:8] == (0.0, "", "")
 
 
 def test_insert_request_uses_occurrence_identity_conflict_clause() -> None:
@@ -931,13 +1026,35 @@ def test_insert_request_accepts_matching_persisted_state() -> None:
     assert "SELECT" in _query_text(connection.executions[1].query)
 
 
-def test_insert_request_rejects_conflicting_persisted_occurrence() -> None:
+@pytest.mark.parametrize(
+    "persisted",
+    [
+        _request(
+            source="source-b",
+        ),
+        _request(
+            cache_mode=CacheMode.BYPASS,
+        ),
+        _request(
+            ttl_seconds=120.0,
+        ),
+        _request(
+            as_of_bucket="bucket-b",
+        ),
+        _request(
+            cache_tag="vendor-v2",
+        ),
+        _request(
+            kind="different-kind",
+        ),
+    ],
+)
+def test_insert_request_rejects_conflicting_persisted_occurrence(
+    persisted: Request,
+) -> None:
     requested = _request()
 
-    persisted = _request(
-        request_id=requested.id,
-        kind="different-kind",
-    )
+    assert persisted.id == requested.id
 
     connection = FakeConnection(
         [
@@ -1001,15 +1118,57 @@ def test_insert_request_rejects_missing_state_after_insert() -> None:
         ),
         (
             _request(
-                session_id="",
+                source="",
             ),
-            r"session_id must be non-empty text",
+            r"source must be non-empty text",
+        ),
+        (
+            _request(
+                source=cast(str, 123),
+            ),
+            r"source must be non-empty text",
         ),
         (
             _request(
                 kind="",
             ),
             r"kind must be non-empty text",
+        ),
+        (
+            _request(
+                ttl_seconds=cast(float, True),
+            ),
+            r"ttl_seconds must be a finite non-negative number or NULL",
+        ),
+        (
+            _request(
+                ttl_seconds=-1.0,
+            ),
+            r"ttl_seconds must be a finite non-negative number or NULL",
+        ),
+        (
+            _request(
+                ttl_seconds=float("inf"),
+            ),
+            r"ttl_seconds must be a finite non-negative number or NULL",
+        ),
+        (
+            _request(
+                ttl_seconds=float("nan"),
+            ),
+            r"ttl_seconds must be a finite non-negative number or NULL",
+        ),
+        (
+            _request(
+                as_of_bucket=cast(str, 123),
+            ),
+            r"as_of_bucket must be text or NULL",
+        ),
+        (
+            _request(
+                cache_tag=cast(str, 123),
+            ),
+            r"cache_tag must be text or NULL",
         ),
     ],
 )

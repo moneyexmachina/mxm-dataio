@@ -11,7 +11,6 @@ from mxm.dataio.models import (
     ResolutionKind,
     Response,
     ResponseStatus,
-    Session,
 )
 from mxm.types import JSONObj
 from mxm.types.timestamps import TSNSScalar, ts_ns_from_int
@@ -25,17 +24,25 @@ def _ts(value: int) -> TSNSScalar:
 
 def _request(
     *,
-    session_id: str = "s1",
+    source: str = "source-a",
     kind: str = "fetch",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     params: JSONObj | None = None,
+    ttl_seconds: float | None = None,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
     created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one representative immutable Request occurrence."""
 
     return Request(
-        session_id=session_id,
+        source=source,
         kind=kind,
+        cache_mode=cache_mode,
         params=params,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=created_at if created_at is not None else _ts(1),
     )
 
@@ -49,19 +56,19 @@ def test_request_hash_determinism() -> None:
     }
 
     first = _request(
-        session_id="s1",
+        source="source-a",
         params=params,
         created_at=_ts(1),
     )
 
     second = _request(
-        session_id="s2",
+        source="source-b",
         params=params,
         created_at=_ts(2),
     )
 
     assert first.id != second.id
-    assert first.session_id != second.session_id
+    assert first.source != second.source
     assert first.created_at != second.created_at
     assert first.hash == second.hash
 
@@ -70,12 +77,10 @@ def test_request_hash_determinism() -> None:
     "second",
     [
         _request(
-            session_id="s2",
             kind="different-kind",
             params={"x": 1},
         ),
         _request(
-            session_id="s2",
             kind="fetch",
             params={"x": 2},
         ),
@@ -87,7 +92,6 @@ def test_request_hash_changes_with_question_content(
     """Every logical question-bearing field participates in Request identity."""
 
     first = _request(
-        session_id="s1",
         kind="fetch",
         params={"x": 1},
     )
@@ -118,21 +122,33 @@ def test_request_hash_is_independent_of_parameter_key_order() -> None:
 
 
 def test_request_hash_excludes_occurrence_context() -> None:
-    """Session membership and occurrence metadata do not affect question identity."""
+    """Resolution context and occurrence metadata do not affect question identity."""
 
     first = _request(
-        session_id="session-a",
+        source="source-a",
+        cache_mode=CacheMode.DEFAULT,
+        ttl_seconds=60.0,
+        as_of_bucket="bucket-a",
+        cache_tag="vendor-v1",
         params={"symbol": "ES"},
         created_at=_ts(1),
     )
 
     second = _request(
-        session_id="session-b",
+        source="source-b",
+        cache_mode=CacheMode.ONLY_IF_CACHED,
+        ttl_seconds=3_600.0,
+        as_of_bucket="bucket-b",
+        cache_tag="vendor-v2",
         params={"symbol": "ES"},
         created_at=_ts(2),
     )
 
-    assert first.session_id != second.session_id
+    assert first.source != second.source
+    assert first.cache_mode != second.cache_mode
+    assert first.ttl_seconds != second.ttl_seconds
+    assert first.as_of_bucket != second.as_of_bucket
+    assert first.cache_tag != second.cache_tag
     assert first.created_at != second.created_at
     assert first.hash == second.hash
 
@@ -346,26 +362,6 @@ def test_adapter_result_meta_dict_contains_generic_metadata() -> None:
             "vendor_request_id": "request-1",
         },
     }
-
-
-def test_session_end_uses_supplied_timestamp() -> None:
-    """Session records the completion timestamp supplied by its runtime."""
-
-    started_at = _ts(10)
-    ended_at = _ts(20)
-
-    session = Session(
-        source="test",
-        cache_mode=CacheMode.DEFAULT,
-        started_at=started_at,
-    )
-
-    assert session.started_at == started_at
-    assert session.ended_at is None
-
-    session.end(ended_at=ended_at)
-
-    assert session.ended_at == ended_at
 
 
 def test_enum_roundtrip() -> None:

@@ -23,7 +23,6 @@ from mxm.dataio.models import (
     ResolutionKind,
     Response,
     ResponseStatus,
-    Session,
 )
 from mxm.types.timestamps import (
     TSNSScalar,
@@ -53,8 +52,9 @@ def test_equivalent_questions_share_hash_across_request_occurrences() -> None:
 
     first = Request(
         id="request-1",
-        session_id="session-1",
+        source="source-a",
         kind="databento.timeseries.get_range",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "dataset": "GLBX.MDP3",
             "symbols": ["ES.c.0"],
@@ -64,8 +64,9 @@ def test_equivalent_questions_share_hash_across_request_occurrences() -> None:
 
     second = Request(
         id="request-2",
-        session_id="session-2",
+        source="source-a",
         kind="databento.timeseries.get_range",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "dataset": "GLBX.MDP3",
             "symbols": ["ES.c.0"],
@@ -74,60 +75,47 @@ def test_equivalent_questions_share_hash_across_request_occurrences() -> None:
     )
 
     assert first.id != second.id
-    assert first.session_id != second.session_id
     assert first.created_at != second.created_at
 
     assert first.hash == second.hash
 
 
-def test_session_context_does_not_participate_in_question_hash() -> None:
+def test_resolution_context_does_not_participate_in_question_hash() -> None:
     """Source and cache context partition reuse, not logical-question identity."""
-
-    first_session = Session(
-        id="session-1",
-        source="source-a",
-        cache_mode=CacheMode.DEFAULT,
-        ttl_seconds=60.0,
-        as_of_bucket="bucket-a",
-        cache_tag="vendor-v1",
-        started_at=_ts("2026-09-03T10:00:00.000000000Z"),
-    )
-
-    second_session = Session(
-        id="session-2",
-        source="source-b",
-        cache_mode=CacheMode.ONLY_IF_CACHED,
-        ttl_seconds=3_600.0,
-        as_of_bucket="bucket-b",
-        cache_tag="vendor-v2",
-        started_at=_ts("2026-09-03T11:00:00.000000000Z"),
-    )
 
     first = Request(
         id="request-1",
-        session_id=first_session.id,
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },
-        created_at=_ts("2026-09-03T10:01:00.000000000Z"),
+        ttl_seconds=60.0,
+        as_of_bucket="bucket-a",
+        cache_tag="vendor-v1",
+        created_at=_ts("2026-09-03T10:00:00.000000000Z"),
     )
 
     second = Request(
         id="request-2",
-        session_id=second_session.id,
+        source="source-b",
         kind="prices",
+        cache_mode=CacheMode.ONLY_IF_CACHED,
         params={
             "symbol": "ES",
         },
-        created_at=_ts("2026-09-03T11:01:00.000000000Z"),
+        ttl_seconds=3_600.0,
+        as_of_bucket="bucket-b",
+        cache_tag="vendor-v2",
+        created_at=_ts("2026-09-03T11:00:00.000000000Z"),
     )
 
-    assert first_session.source != second_session.source
-    assert first_session.cache_mode != second_session.cache_mode
-    assert first_session.ttl_seconds != second_session.ttl_seconds
-    assert first_session.as_of_bucket != second_session.as_of_bucket
-    assert first_session.cache_tag != second_session.cache_tag
+    assert first.source != second.source
+    assert first.cache_mode != second.cache_mode
+    assert first.ttl_seconds != second.ttl_seconds
+    assert first.as_of_bucket != second.as_of_bucket
+    assert first.cache_tag != second.cache_tag
 
     assert first.hash == second.hash
 
@@ -137,8 +125,9 @@ def test_question_bearing_fields_define_request_hash() -> None:
 
     baseline = Request(
         id="request-1",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },
@@ -147,8 +136,9 @@ def test_question_bearing_fields_define_request_hash() -> None:
 
     different_kind = Request(
         id="request-2",
-        session_id="session-1",
+        source="source-a",
         kind="settlements",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },
@@ -157,8 +147,9 @@ def test_question_bearing_fields_define_request_hash() -> None:
 
     different_params = Request(
         id="request-3",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "NQ",
         },
@@ -174,8 +165,9 @@ def test_question_hash_is_independent_of_parameter_key_order() -> None:
 
     first = Request(
         id="request-1",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
             "schema": "ohlcv-1h",
@@ -186,8 +178,9 @@ def test_question_hash_is_independent_of_parameter_key_order() -> None:
 
     second = Request(
         id="request-2",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "limit": 100,
             "schema": "ohlcv-1h",
@@ -209,8 +202,9 @@ def test_equivalent_questions_remain_distinct_request_occurrences() -> None:
 
     first = Request(
         id="request-1",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },
@@ -219,8 +213,9 @@ def test_equivalent_questions_remain_distinct_request_occurrences() -> None:
 
     second = Request(
         id="request-2",
-        session_id="session-1",
+        source="source-a",
         kind="prices",
+        cache_mode=CacheMode.DEFAULT,
         params={
             "symbol": "ES",
         },

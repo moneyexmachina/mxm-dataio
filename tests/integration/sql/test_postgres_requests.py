@@ -6,8 +6,8 @@ They prove that:
 
 - complete Request state round-trips through PostgreSQL;
 - multiple Request occurrences may share one logical-question hash across
-  different Sessions;
-- Session membership is relationally enforced;
+  different resolution contexts;
+- Request persistence has no parent grouping dependency;
 - Request JSON params survive PostgreSQL JSONB persistence;
 - Request identity is idempotent while conflicting occurrence state is rejected;
 - canonical MXM timestamps survive the real PostgreSQL timestamp boundary.
@@ -22,12 +22,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-from psycopg.errors import ForeignKeyViolation
 
 from mxm.dataio.models import (
     CacheMode,
     Request,
-    Session,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import (
@@ -36,7 +34,6 @@ from mxm.dataio.sql.requests import (
     fetch_requests_by_hash,
     insert_request,
 )
-from mxm.dataio.sql.sessions import insert_session
 from mxm.types import JSONObj
 from mxm.types.timestamps import (
     TSNSScalar,
@@ -46,48 +43,29 @@ from mxm.types.timestamps import (
 pytestmark = pytest.mark.postgres
 
 
-def _session(
-    *,
-    session_id: str,
-    source: str = "test-source",
-    cache_mode: CacheMode = CacheMode.DEFAULT,
-    ttl_seconds: float | None = 300.0,
-    as_of_bucket: str | None = None,
-    cache_tag: str | None = None,
-    started_at: TSNSScalar | None = None,
-) -> Session:
-    """Construct one deterministic parent DataIO Session."""
-
-    return Session(
-        id=session_id,
-        source=source,
-        cache_mode=cache_mode,
-        ttl_seconds=ttl_seconds,
-        as_of_bucket=as_of_bucket,
-        cache_tag=cache_tag,
-        started_at=(
-            started_at
-            if started_at is not None
-            else ts_ns_from_str("2026-09-03T10:00:00.123456000Z")
-        ),
-    )
-
-
 def _request(
     *,
     request_id: str,
-    session_id: str,
+    source: str = "test-source",
     kind: str = "prices",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     params: JSONObj | None = None,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = None,
+    cache_tag: str | None = None,
     created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one deterministic Request occurrence."""
 
     return Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind=kind,
+        cache_mode=cache_mode,
         params=params,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=(
             created_at
             if created_at is not None
@@ -103,20 +81,14 @@ def test_requests_round_trip_through_postgres(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-round-trip",
+    request = _request(
+        request_id="request-round-trip",
         source="example-source",
+        kind="databento.timeseries.get_range",
         cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03T10",
         cache_tag="vendor-v1",
-        started_at=ts_ns_from_str("2026-09-03T10:00:00.123456000Z"),
-    )
-
-    request = _request(
-        request_id="request-round-trip",
-        session_id=session.id,
-        kind="databento.timeseries.get_range",
         params={
             "symbol": "ES",
             "fields": [
@@ -131,12 +103,6 @@ def test_requests_round_trip_through_postgres(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -160,34 +126,20 @@ def test_requests_round_trip_through_postgres(
     assert missing_request is None
 
 
-def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
+def test_equivalent_questions_persist_as_distinct_occurrences_across_contexts(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The same logical question may occur independently in different Sessions."""
+    """The same logical question may occur in different resolution contexts."""
 
     database = migrated_postgres_database
 
-    first_session = _session(
-        session_id="session-question-a",
+    first = _request(
+        request_id="request-1",
         source="source-a",
         cache_mode=CacheMode.DEFAULT,
         ttl_seconds=300.0,
         as_of_bucket="bucket-a",
         cache_tag="vendor-v1",
-    )
-
-    second_session = _session(
-        session_id="session-question-b",
-        source="source-b",
-        cache_mode=CacheMode.BYPASS,
-        ttl_seconds=None,
-        as_of_bucket="bucket-b",
-        cache_tag="vendor-v2",
-    )
-
-    first = _request(
-        request_id="request-1",
-        session_id=first_session.id,
         created_at=ts_ns_from_str("2026-09-03T10:05:00.000000000Z"),
         params={
             "symbol": "ES",
@@ -196,7 +148,11 @@ def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
 
     second = _request(
         request_id="request-2",
-        session_id=second_session.id,
+        source="source-b",
+        cache_mode=CacheMode.BYPASS,
+        ttl_seconds=None,
+        as_of_bucket="bucket-b",
+        cache_tag="vendor-v2",
         created_at=ts_ns_from_str("2026-09-03T10:06:00.000000000Z"),
         params={
             "symbol": "ES",
@@ -204,22 +160,10 @@ def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     )
 
     assert first.id != second.id
-    assert first.session_id != second.session_id
+    assert first.source != second.source
     assert first.hash == second.hash
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=first_session,
-        )
-
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=second_session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -245,28 +189,26 @@ def test_equivalent_questions_persist_as_distinct_occurrences_across_sessions(
     }
 
 
-def test_request_requires_persisted_parent_session(
+def test_request_has_no_parent_grouping_dependency(
     migrated_postgres_database: PostgresDatabase,
 ) -> None:
-    """The real foreign key requires every Request to belong to a Session."""
+    """A Request persists directly without a parent grouping record."""
 
     database = migrated_postgres_database
 
     request = _request(
-        request_id="request-missing-session",
-        session_id="session-not-persisted",
+        request_id="request-without-parent",
         params={
             "symbol": "ES",
         },
     )
 
-    with pytest.raises(ForeignKeyViolation):
-        with database.transaction() as connection:
-            insert_request(
-                connection,
-                schema=database.schema,
-                request=request,
-            )
+    with database.transaction() as connection:
+        insert_request(
+            connection,
+            schema=database.schema,
+            request=request,
+        )
 
     with database.transaction() as connection:
         persisted_request = fetch_request_by_id(
@@ -275,7 +217,7 @@ def test_request_requires_persisted_parent_session(
             request_id=request.id,
         )
 
-    assert persisted_request is None
+    assert persisted_request == request
 
 
 def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
@@ -285,25 +227,14 @@ def test_request_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-request-conflict",
-    )
-
     request = _request(
         request_id="request-stable-identity",
-        session_id=session.id,
         params={
             "symbol": "ES",
         },
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -351,13 +282,8 @@ def test_request_json_round_trips_through_postgres(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-json",
-    )
-
     request = _request(
         request_id="request-json",
-        session_id=session.id,
         params={
             "symbol": "ES",
             "fields": [
@@ -383,12 +309,6 @@ def test_request_json_round_trips_through_postgres(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,

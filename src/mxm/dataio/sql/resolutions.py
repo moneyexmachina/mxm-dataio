@@ -16,8 +16,9 @@ Resolution semantics distinguish two cases:
   occurrence and reused to satisfy this one.
 
 This module validates that structural relationship between Resolution and
-Response. It does not determine whether reuse was permitted by Session cache
-policy, TTL, source, as-of bucket, cache tag, or other runtime decision inputs.
+Response. It does not determine whether reuse was permitted by the acquiring
+Request's cache policy, TTL, source, as-of bucket, cache tag, or other runtime
+decision inputs.
 
 Model timestamps use the canonical MXM ``TSNSScalar`` representation.
 PostgreSQL stores timestamps as ``timestamptz``. The representation bridge

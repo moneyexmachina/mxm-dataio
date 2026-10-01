@@ -6,7 +6,7 @@ PostgreSQL schema.
 They prove that reusable Responses are discovered from their original
 acquisition context:
 
-    Session -> Request -> Response
+    Request -> Response
 
 Candidate eligibility requires matching:
 
@@ -21,7 +21,7 @@ deterministically.
 
 These tests also prove an important architectural exclusion: a historical
 REUSED Resolution does not transport a Response into the reusing Request's
-Session namespace.
+acquisition namespace.
 
 Cache-mode decisions, TTL calculation, payload-store availability, Resolution
 creation, and external acquisition belong to the runtime and are tested
@@ -41,14 +41,12 @@ from mxm.dataio.models import (
     ResolutionKind,
     Response,
     ResponseStatus,
-    Session,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import insert_request
 from mxm.dataio.sql.resolutions import insert_resolution
 from mxm.dataio.sql.responses import insert_response
 from mxm.dataio.sql.reuse import fetch_reuse_candidate_response_id
-from mxm.dataio.sql.sessions import insert_session
 from mxm.types import JSONObj
 from mxm.types.timestamps import (
     TSNSScalar,
@@ -73,47 +71,25 @@ def _checksum(
     ).hexdigest()
 
 
-def _session(
-    *,
-    session_id: str,
-    source: str = "source-a",
-    cache_mode: CacheMode = CacheMode.DEFAULT,
-    ttl_seconds: float | None = 300.0,
-    as_of_bucket: str | None = "bucket-a",
-    cache_tag: str | None = "vendor-v1",
-    started_at: TSNSScalar | None = None,
-) -> Session:
-    """Construct one deterministic acquisition Session."""
-
-    return Session(
-        id=session_id,
-        source=source,
-        cache_mode=cache_mode,
-        ttl_seconds=ttl_seconds,
-        as_of_bucket=as_of_bucket,
-        cache_tag=cache_tag,
-        started_at=(
-            started_at
-            if started_at is not None
-            else ts_ns_from_str("2026-09-07T07:00:00.000000000Z")
-        ),
-    )
-
-
 def _request(
     *,
     request_id: str,
-    session_id: str,
+    source: str = "source-a",
     kind: str = "prices",
+    cache_mode: CacheMode = CacheMode.DEFAULT,
     params: JSONObj | None = None,
+    ttl_seconds: float | None = 300.0,
+    as_of_bucket: str | None = "bucket-a",
+    cache_tag: str | None = "vendor-v1",
     created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one deterministic logical-question occurrence."""
 
     return Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind=kind,
+        cache_mode=cache_mode,
         params=(
             params
             if params is not None
@@ -121,6 +97,9 @@ def _request(
                 "symbol": "ES",
             }
         ),
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=(
             created_at
             if created_at is not None
@@ -168,19 +147,12 @@ def _response(
 def _persist_acquisition(
     database: PostgresDatabase,
     *,
-    session: Session,
     request: Request,
     response: Response,
 ) -> None:
-    """Persist one Session -> Request -> Response acquisition hierarchy."""
+    """Persist one Request -> Response acquisition hierarchy."""
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -231,7 +203,6 @@ def test_reuse_lookup_returns_none_when_no_candidate_exists(
 
     request = _request(
         request_id="current-request",
-        session_id="current-session",
     )
 
     candidate = _lookup(
@@ -252,16 +223,11 @@ def test_reuse_lookup_finds_matching_acquired_response(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-acquiring",
+    request = _request(
+        request_id="request-acquiring",
         source="source-a",
         as_of_bucket="bucket-a",
         cache_tag="vendor-v1",
-    )
-
-    request = _request(
-        request_id="request-acquiring",
-        session_id=session.id,
     )
 
     response = _response(
@@ -271,17 +237,16 @@ def test_reuse_lookup_finds_matching_acquired_response(
 
     _persist_acquisition(
         database,
-        session=session,
         request=request,
         response=response,
     )
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=request.source,
         request_hash=request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=request.as_of_bucket,
+        cache_tag=request.cache_tag,
     )
 
     assert candidate == response.id
@@ -326,16 +291,11 @@ def test_reuse_lookup_requires_complete_namespace_match(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-acquiring",
+    request = _request(
+        request_id="request-acquiring",
         source="source-a",
         as_of_bucket="bucket-a",
         cache_tag="vendor-v1",
-    )
-
-    request = _request(
-        request_id="request-acquiring",
-        session_id=session.id,
     )
 
     response = _response(
@@ -345,7 +305,6 @@ def test_reuse_lookup_requires_complete_namespace_match(
 
     _persist_acquisition(
         database,
-        session=session,
         request=request,
         response=response,
     )
@@ -368,16 +327,11 @@ def test_reuse_lookup_matches_null_partition_coordinates(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-null-partition",
+    request = _request(
+        request_id="request-null-partition",
         source="source-a",
         as_of_bucket=None,
         cache_tag=None,
-    )
-
-    request = _request(
-        request_id="request-null-partition",
-        session_id=session.id,
     )
 
     response = _response(
@@ -387,7 +341,6 @@ def test_reuse_lookup_matches_null_partition_coordinates(
 
     _persist_acquisition(
         database,
-        session=session,
         request=request,
         response=response,
     )
@@ -419,13 +372,8 @@ def test_reuse_lookup_requires_same_logical_question_hash(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-question",
-    )
-
     acquired_request = _request(
         request_id="request-es",
-        session_id=session.id,
         params={
             "symbol": "ES",
         },
@@ -438,7 +386,6 @@ def test_reuse_lookup_requires_same_logical_question_hash(
 
     current_request = _request(
         request_id="request-nq",
-        session_id="current-session",
         params={
             "symbol": "NQ",
         },
@@ -448,17 +395,16 @@ def test_reuse_lookup_requires_same_logical_question_hash(
 
     _persist_acquisition(
         database,
-        session=session,
         request=acquired_request,
         response=response,
     )
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=acquired_request.source,
         request_hash=current_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=acquired_request.as_of_bucket,
+        cache_tag=acquired_request.cache_tag,
     )
 
     assert candidate is None
@@ -476,19 +422,13 @@ def test_reuse_lookup_excludes_error_responses(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-status",
-    )
-
     ok_request = _request(
         request_id="request-ok",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-07T07:01:00.000000000Z"),
     )
 
     error_request = _request(
         request_id="request-error",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-07T07:10:00.000000000Z"),
     )
 
@@ -511,12 +451,6 @@ def test_reuse_lookup_excludes_error_responses(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -543,10 +477,10 @@ def test_reuse_lookup_excludes_error_responses(
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=ok_request.source,
         request_hash=ok_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=ok_request.as_of_bucket,
+        cache_tag=ok_request.cache_tag,
     )
 
     assert candidate == ok_response.id
@@ -566,19 +500,13 @@ def test_reuse_lookup_applies_inclusive_fetched_at_cutoff(
 
     cutoff = ts_ns_from_str("2026-09-07T07:30:00.123456000Z")
 
-    session = _session(
-        session_id="session-freshness",
-    )
-
     stale_request = _request(
         request_id="request-stale",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-07T07:10:00.000000000Z"),
     )
 
     boundary_request = _request(
         request_id="request-boundary",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-07T07:20:00.000000000Z"),
     )
 
@@ -597,12 +525,6 @@ def test_reuse_lookup_applies_inclusive_fetched_at_cutoff(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -629,10 +551,10 @@ def test_reuse_lookup_applies_inclusive_fetched_at_cutoff(
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=stale_request.source,
         request_hash=stale_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=stale_request.as_of_bucket,
+        cache_tag=stale_request.cache_tag,
         minimum_fetched_at=cutoff,
     )
 
@@ -646,13 +568,8 @@ def test_reuse_lookup_returns_none_when_all_candidates_are_stale(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-stale",
-    )
-
     request = _request(
         request_id="request-stale",
-        session_id=session.id,
     )
 
     response = _response(
@@ -663,17 +580,16 @@ def test_reuse_lookup_returns_none_when_all_candidates_are_stale(
 
     _persist_acquisition(
         database,
-        session=session,
         request=request,
         response=response,
     )
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=request.source,
         request_hash=request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=request.as_of_bucket,
+        cache_tag=request.cache_tag,
         minimum_fetched_at=ts_ns_from_str("2026-09-07T07:30:00.000000000Z"),
     )
 
@@ -692,18 +608,12 @@ def test_reuse_lookup_prefers_newest_fetched_response(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-order-fetched",
-    )
-
     first_request = _request(
         request_id="request-1",
-        session_id=session.id,
     )
 
     second_request = _request(
         request_id="request-2",
-        session_id=session.id,
     )
 
     first_response = _response(
@@ -721,12 +631,6 @@ def test_reuse_lookup_prefers_newest_fetched_response(
     assert first_request.hash == second_request.hash
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -753,10 +657,10 @@ def test_reuse_lookup_prefers_newest_fetched_response(
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=first_request.source,
         request_hash=first_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=first_request.as_of_bucket,
+        cache_tag=first_request.cache_tag,
     )
 
     assert candidate == second_response.id
@@ -769,18 +673,12 @@ def test_reuse_lookup_uses_created_at_to_break_fetched_at_ties(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-order-created",
-    )
-
     first_request = _request(
         request_id="request-1",
-        session_id=session.id,
     )
 
     second_request = _request(
         request_id="request-2",
-        session_id=session.id,
     )
 
     fetched_at = ts_ns_from_str("2026-09-07T07:30:00.000000000Z")
@@ -802,12 +700,6 @@ def test_reuse_lookup_uses_created_at_to_break_fetched_at_ties(
     assert first_request.hash == second_request.hash
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -834,10 +726,10 @@ def test_reuse_lookup_uses_created_at_to_break_fetched_at_ties(
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=first_request.source,
         request_hash=first_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=first_request.as_of_bucket,
+        cache_tag=first_request.cache_tag,
     )
 
     # response-z has the lexically greater ID, so this specifically proves
@@ -852,18 +744,12 @@ def test_reuse_lookup_uses_response_id_as_final_tie_breaker(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-order-id",
-    )
-
     first_request = _request(
         request_id="request-1",
-        session_id=session.id,
     )
 
     second_request = _request(
         request_id="request-2",
-        session_id=session.id,
     )
 
     created_at = ts_ns_from_str("2026-09-07T07:29:00.000000000Z")
@@ -887,12 +773,6 @@ def test_reuse_lookup_uses_response_id_as_final_tie_breaker(
     assert first_request.hash == second_request.hash
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -919,10 +799,10 @@ def test_reuse_lookup_uses_response_id_as_final_tie_breaker(
 
     candidate = _lookup(
         database,
-        source=session.source,
+        source=first_request.source,
         request_hash=first_request.hash,
-        as_of_bucket=session.as_of_bucket,
-        cache_tag=session.cache_tag,
+        as_of_bucket=first_request.as_of_bucket,
+        cache_tag=first_request.cache_tag,
     )
 
     assert candidate == second_response.id
@@ -940,16 +820,11 @@ def test_reused_resolution_does_not_transport_response_between_namespaces(
 
     database = migrated_postgres_database
 
-    acquiring_session = _session(
-        session_id="session-acquiring",
+    acquiring_request = _request(
+        request_id="request-acquiring",
         source="source-a",
         as_of_bucket="bucket-a",
         cache_tag="vendor-v1",
-    )
-
-    acquiring_request = _request(
-        request_id="request-acquiring",
-        session_id=acquiring_session.id,
     )
 
     response = _response(
@@ -957,22 +832,16 @@ def test_reused_resolution_does_not_transport_response_between_namespaces(
         request_id=acquiring_request.id,
     )
 
-    reusing_session = _session(
-        session_id="session-reusing",
+    reusing_request = _request(
+        request_id="request-reusing",
         source="source-a",
         as_of_bucket="bucket-b",
         cache_tag="vendor-v1",
-        started_at=ts_ns_from_str("2026-09-07T08:00:00.000000000Z"),
-    )
-
-    reusing_request = _request(
-        request_id="request-reusing",
-        session_id=reusing_session.id,
         created_at=ts_ns_from_str("2026-09-07T08:01:00.000000000Z"),
     )
 
     assert acquiring_request.hash == reusing_request.hash
-    assert acquiring_session.as_of_bucket != reusing_session.as_of_bucket
+    assert acquiring_request.as_of_bucket != reusing_request.as_of_bucket
 
     acquired_resolution = Resolution(
         request_id=acquiring_request.id,
@@ -989,18 +858,6 @@ def test_reused_resolution_does_not_transport_response_between_namespaces(
     )
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=acquiring_session,
-        )
-
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=reusing_session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -1036,18 +893,18 @@ def test_reused_resolution_does_not_transport_response_between_namespaces(
 
     original_namespace_candidate = _lookup(
         database,
-        source=acquiring_session.source,
+        source=acquiring_request.source,
         request_hash=acquiring_request.hash,
-        as_of_bucket=acquiring_session.as_of_bucket,
-        cache_tag=acquiring_session.cache_tag,
+        as_of_bucket=acquiring_request.as_of_bucket,
+        cache_tag=acquiring_request.cache_tag,
     )
 
     reusing_namespace_candidate = _lookup(
         database,
-        source=reusing_session.source,
+        source=reusing_request.source,
         request_hash=reusing_request.hash,
-        as_of_bucket=reusing_session.as_of_bucket,
-        cache_tag=reusing_session.cache_tag,
+        as_of_bucket=reusing_request.as_of_bucket,
+        cache_tag=reusing_request.cache_tag,
     )
 
     assert original_namespace_candidate == response.id

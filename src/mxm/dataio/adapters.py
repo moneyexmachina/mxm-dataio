@@ -62,7 +62,7 @@ class MXMDataIoAdapter(Protocol):
         ...
 
     def close(self) -> None:
-        """Release any held resources (e.g., sessions or sockets)."""
+        """Release any held resources, such as connections or sockets."""
         ...
 
 

@@ -4,11 +4,9 @@ mxm-dataio is a durable cache around costly external data acquisitions.
 
 It records:
 
-    Session
-        the source and cache context under which requests are made
-
     Request
-        one occurrence of a logical external data question
+        one occurrence of a logical external data question and the resolution
+        context under which it is satisfied
 
     Resolution
         whether that request was satisfied by a newly acquired response
@@ -124,51 +122,14 @@ class ResolutionKind(str, Enum):
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(slots=True)
-class Session:
-    """Stable source and cache context for a group of Request occurrences.
-
-    ``source`` identifies the external source adapter namespace.
-
-    ``cache_mode`` determines whether previously acquired responses may or
-    must be reused.
-
-    ``ttl_seconds`` optionally limits the age of reusable responses.
-
-    ``as_of_bucket`` and ``cache_tag`` are opaque caller-supplied cache
-    partition coordinates. DataIO compares them for equality but assigns no
-    temporal, versioning, or domain semantics to them.
-
-    ``started_at`` and ``ended_at`` use the canonical MXM timestamp
-    representation. The runtime supplies these timestamps; Session does not
-    acquire wall-clock time itself.
-    """
-
-    source: str
-    cache_mode: CacheMode
-    started_at: TSNSScalar
-
-    ttl_seconds: float | None = None
-    as_of_bucket: str | None = None
-    cache_tag: str | None = None
-
-    id: str = field(default_factory=_uuid)
-    ended_at: TSNSScalar | None = None
-
-    def end(self, *, ended_at: TSNSScalar) -> None:
-        """Mark the Session as completed at the supplied timestamp."""
-
-        self.ended_at = ended_at
-
-
 @dataclass(frozen=True, slots=True)
 class Request:
     """One immutable occurrence of a logical external data question.
 
     ``id`` identifies this individual Request occurrence.
 
-    ``session_id`` identifies the Session whose source and cache context apply
-    to this occurrence.
+    ``source`` identifies the external source adapter namespace and forms part
+    of the reuse namespace.
 
     ``kind`` identifies the logical vendor operation, for example
     ``"databento.timeseries.get_range"``.
@@ -181,19 +142,28 @@ class Request:
     ``hash`` identifies the logical question itself. It is derived only from
     ``kind`` and ``params``.
 
-    Session-owned context such as source, cache mode, TTL, as-of bucket, and
-    cache tag deliberately does not participate in the question hash. Those
-    values form the separate cache-reuse context.
+    ``cache_mode`` and ``ttl_seconds`` record the caller-supplied reuse policy
+    for this Request occurrence.
+
+    ``as_of_bucket`` and ``cache_tag`` are opaque caller-supplied reuse
+    partition coordinates. DataIO compares them for equality but assigns no
+    temporal, versioning, or domain semantics to them.
+
+    Resolution context deliberately does not participate in the question hash.
 
     ``created_at`` records when this Request occurrence was created. The
     runtime supplies the timestamp.
     """
 
-    session_id: str
+    source: str
     kind: str
+    cache_mode: CacheMode
     created_at: TSNSScalar
 
     params: JSONObj | None = None
+    ttl_seconds: float | None = None
+    as_of_bucket: str | None = None
+    cache_tag: str | None = None
 
     id: str = field(default_factory=_uuid)
     hash: str = field(init=False)

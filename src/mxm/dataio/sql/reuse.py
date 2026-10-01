@@ -5,10 +5,10 @@ observation eligible for consideration by the DataIO reuse runtime.
 
 Reuse candidate selection is a cross-entity read model. It relates:
 
-    Session -> Request -> Response
+    Request -> Response
 
-The Request hash identifies the logical external question. The acquiring
-Session supplies the source and opaque reuse-partition context.
+The acquiring Request supplies both the logical-question hash and its durable
+source and opaque reuse-partition context.
 
 A candidate must therefore have been acquired under the same:
 
@@ -31,7 +31,7 @@ Candidate ordering is:
 
 This module deliberately does not:
 
-- inspect Session cache mode;
+- inspect the acquiring Request's cache mode or TTL;
 - calculate TTL;
 - inspect or create Resolutions;
 - inspect payload-store availability or integrity;
@@ -146,12 +146,10 @@ def fetch_reuse_candidate_response_id(
         FROM {} AS response
         JOIN {} AS acquiring_request
           ON acquiring_request.id = response.request_id
-        JOIN {} AS acquiring_session
-          ON acquiring_session.id = acquiring_request.session_id
-        WHERE acquiring_session.source = %s
+        WHERE acquiring_request.source = %s
           AND acquiring_request.hash = %s
-          AND acquiring_session.as_of_bucket IS NOT DISTINCT FROM %s
-          AND acquiring_session.cache_tag IS NOT DISTINCT FROM %s
+          AND acquiring_request.as_of_bucket IS NOT DISTINCT FROM %s
+          AND acquiring_request.cache_tag IS NOT DISTINCT FROM %s
           AND response.status = %s
           {}
         ORDER BY
@@ -168,10 +166,6 @@ def fetch_reuse_candidate_response_id(
         sql.Identifier(
             schema,
             "requests",
-        ),
-        sql.Identifier(
-            schema,
-            "sessions",
         ),
         freshness_clause,
     )

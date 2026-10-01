@@ -2,21 +2,21 @@
 
 This module owns the PostgreSQL representation of ``Request`` objects.
 
-A Request is one immutable occurrence of a logical external data question made
-within a DataIO Session.
+A Request is one immutable occurrence of a logical external data question and
+the resolution context under which that occurrence is satisfied.
 
 ``Request.id`` identifies the individual occurrence.
 
 ``Request.hash`` identifies the logical question itself: ``kind`` plus
-canonical ``params``. It deliberately excludes Session-owned context such as
+canonical ``params``. It deliberately excludes resolution context such as
 source, cache policy, TTL, as-of bucket, and cache tag.
 
 Transport details such as HTTP method, request body placement, SDK invocation,
 authentication, and pagination belong to the source adapter and are not part
 of the persisted Request model.
 
-Multiple Request occurrences, including occurrences belonging to different
-Sessions, may therefore legitimately share one question hash.
+Multiple Request occurrences with different resolution contexts may therefore
+legitimately share one question hash.
 
 Model timestamps use the canonical MXM ``TSNSScalar`` representation.
 PostgreSQL stores timestamps as ``timestamptz``. The representation bridge
@@ -30,6 +30,7 @@ higher-level DataIO operation.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import replace
@@ -39,7 +40,7 @@ from typing import cast
 from psycopg import Connection, sql
 from psycopg.types.json import Jsonb
 
-from mxm.dataio.models import Request
+from mxm.dataio.models import CacheMode, Request
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.sql_timestamps import (
     SqlTimestampError,
@@ -89,9 +90,13 @@ def fetch_request_by_id(
         """
         SELECT
             id,
-            session_id,
+            source,
             kind,
             params,
+            cache_mode,
+            ttl_seconds,
+            as_of_bucket,
+            cache_tag,
             hash,
             created_at
         FROM {}
@@ -133,8 +138,8 @@ def fetch_requests_by_hash(
     The returned mapping is keyed by Request occurrence ID.
 
     The hash identifies the logical question only. It does not establish cache
-    reuse eligibility: Session-owned source and cache-partition context must
-    also be considered by the higher-level reuse logic.
+    reuse eligibility: source and cache-partition context must also be
+    considered by the higher-level reuse logic.
 
     Results are deterministically ordered by creation time and Request ID.
     """
@@ -145,9 +150,13 @@ def fetch_requests_by_hash(
         """
         SELECT
             id,
-            session_id,
+            source,
             kind,
             params,
+            cache_mode,
+            ttl_seconds,
+            as_of_bucket,
+            cache_tag,
             hash,
             created_at
         FROM {}
@@ -203,13 +212,21 @@ def insert_request(
         """
         INSERT INTO {} (
             id,
-            session_id,
+            source,
             kind,
             params,
+            cache_mode,
+            ttl_seconds,
+            as_of_bucket,
+            cache_tag,
             hash,
             created_at
         )
         VALUES (
+            %s,
+            %s,
+            %s,
+            %s,
             %s,
             %s,
             %s,
@@ -233,9 +250,13 @@ def insert_request(
             query,
             (
                 request.id,
-                request.session_id,
+                request.source,
                 request.kind,
                 params_value,
+                request.cache_mode.value,
+                request.ttl_seconds,
+                request.as_of_bucket,
+                request.cache_tag,
                 request.hash,
                 _ts_ns_to_db_datetime(
                     request.created_at,
@@ -318,7 +339,7 @@ def _request_from_row(
 ) -> Request:
     """Reconstruct one validated Request occurrence from a PostgreSQL row."""
 
-    if len(row) != 6:
+    if len(row) != 10:
         raise RequestPersistenceError(
             f"Request query returned an unexpected row shape: {row!r}"
         )
@@ -328,9 +349,9 @@ def _request_from_row(
         field="id",
     )
 
-    session_id = _require_text(
+    source = _require_text(
         row[1],
-        field="session_id",
+        field="source",
     )
 
     kind = _require_text(
@@ -343,20 +364,51 @@ def _request_from_row(
         field="params",
     )
 
-    persisted_hash = _require_hash(
+    cache_mode_text = _require_text(
         row[4],
+        field="cache_mode",
+    )
+
+    ttl_seconds = _optional_non_negative_float(
+        row[5],
+        field="ttl_seconds",
+    )
+
+    as_of_bucket = _optional_text(
+        row[6],
+        field="as_of_bucket",
+    )
+
+    cache_tag = _optional_text(
+        row[7],
+        field="cache_tag",
+    )
+
+    persisted_hash = _require_hash(
+        row[8],
     )
 
     created_at = _require_db_timestamp(
-        row[5],
+        row[9],
         field="created_at",
     )
 
+    try:
+        cache_mode = CacheMode(cache_mode_text)
+    except ValueError as err:
+        raise RequestPersistenceError(
+            f"Persisted Request cache_mode is not recognised: {cache_mode_text!r}"
+        ) from err
+
     request = Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind=kind,
+        cache_mode=cache_mode,
         params=params,
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=created_at,
     )
 
@@ -445,8 +497,8 @@ def _validate_request(
     )
 
     _validate_identifier(
-        request.session_id,
-        field="session_id",
+        request.source,
+        field="source",
     )
 
     _validate_identifier(
@@ -459,6 +511,21 @@ def _validate_request(
             request.params,
             field="params",
         )
+
+    _validate_optional_non_negative_float(
+        request.ttl_seconds,
+        field="ttl_seconds",
+    )
+
+    _validate_optional_text(
+        request.as_of_bucket,
+        field="as_of_bucket",
+    )
+
+    _validate_optional_text(
+        request.cache_tag,
+        field="cache_tag",
+    )
 
     _validate_timestamp(
         request.created_at,
@@ -509,6 +576,83 @@ def _require_text(
     if not isinstance(value, str) or not value:
         raise RequestPersistenceError(
             f"Persisted Request {field} must be non-empty text, got {value!r}"
+        )
+
+    return value
+
+
+def _validate_optional_non_negative_float(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    """Require a finite non-negative numeric value or NULL."""
+
+    if value is None:
+        return
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise RequestPersistenceError(
+            f"Request {field} must be a finite non-negative number or NULL, "
+            f"got {value!r}"
+        )
+
+
+def _optional_non_negative_float(
+    value: object,
+    *,
+    field: str,
+) -> float | None:
+    """Require a persisted finite non-negative numeric value or NULL."""
+
+    if value is None:
+        return None
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise RequestPersistenceError(
+            f"Persisted Request {field} must be a finite non-negative number "
+            f"or NULL, got {value!r}"
+        )
+
+    return float(value)
+
+
+def _validate_optional_text(
+    value: object,
+    *,
+    field: str,
+) -> None:
+    """Require text or NULL."""
+
+    if value is not None and not isinstance(value, str):
+        raise RequestPersistenceError(
+            f"Request {field} must be text or NULL, got {value!r}"
+        )
+
+
+def _optional_text(
+    value: object,
+    *,
+    field: str,
+) -> str | None:
+    """Require persisted text or NULL."""
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise RequestPersistenceError(
+            f"Persisted Request {field} must be text or NULL, got {value!r}"
         )
 
     return value

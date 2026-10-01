@@ -30,7 +30,6 @@ from mxm.dataio.models import (
     Request,
     Response,
     ResponseStatus,
-    Session,
 )
 from mxm.dataio.sql.postgres import PostgresDatabase
 from mxm.dataio.sql.requests import insert_request
@@ -40,7 +39,6 @@ from mxm.dataio.sql.responses import (
     fetch_responses_by_payload_checksum,
     insert_response,
 )
-from mxm.dataio.sql.sessions import insert_session
 from mxm.types import JSONObj
 from mxm.types.timestamps import (
     TSNSScalar,
@@ -63,48 +61,29 @@ def _checksum(
     return hashlib.sha256(data).hexdigest()
 
 
-def _session(
+def _request(
     *,
-    session_id: str,
+    request_id: str,
     source: str = "test-source",
     cache_mode: CacheMode = CacheMode.DEFAULT,
     ttl_seconds: float | None = 300.0,
     as_of_bucket: str | None = None,
     cache_tag: str | None = None,
-    started_at: TSNSScalar | None = None,
-) -> Session:
-    """Construct one deterministic parent DataIO Session."""
-
-    return Session(
-        id=session_id,
-        source=source,
-        cache_mode=cache_mode,
-        ttl_seconds=ttl_seconds,
-        as_of_bucket=as_of_bucket,
-        cache_tag=cache_tag,
-        started_at=(
-            started_at
-            if started_at is not None
-            else ts_ns_from_str("2026-09-03T08:00:00.123456000Z")
-        ),
-    )
-
-
-def _request(
-    *,
-    request_id: str,
-    session_id: str,
     created_at: TSNSScalar | None = None,
 ) -> Request:
     """Construct one deterministic parent Request occurrence."""
 
     return Request(
         id=request_id,
-        session_id=session_id,
+        source=source,
         kind="prices",
+        cache_mode=cache_mode,
         params={
             "symbol": "ES",
         },
+        ttl_seconds=ttl_seconds,
+        as_of_bucket=as_of_bucket,
+        cache_tag=cache_tag,
         created_at=(
             created_at
             if created_at is not None
@@ -158,18 +137,11 @@ def _response(
 def _insert_parent_request(
     database: PostgresDatabase,
     *,
-    session: Session,
     request: Request,
 ) -> None:
-    """Persist the Session → Request parent hierarchy."""
+    """Persist the parent Request occurrence."""
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -189,18 +161,13 @@ def test_response_round_trips_through_postgres(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-response-round-trip",
+    request = _request(
+        request_id="request-response-round-trip",
         source="example-source",
         cache_mode=CacheMode.ONLY_IF_CACHED,
         ttl_seconds=600.0,
         as_of_bucket="2026-09-03T08",
         cache_tag="vendor-v1",
-    )
-
-    request = _request(
-        request_id="request-response-round-trip",
-        session_id=session.id,
     )
 
     response = _response(
@@ -223,7 +190,6 @@ def test_response_round_trips_through_postgres(
 
     _insert_parent_request(
         database,
-        session=session,
         request=request,
     )
 
@@ -251,19 +217,13 @@ def test_distinct_observations_can_share_payload_identity(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-shared-payload",
-    )
-
     first_request = _request(
         request_id="request-1",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-03T08:01:00.000000000Z"),
     )
 
     second_request = _request(
         request_id="request-2",
-        session_id=session.id,
         created_at=ts_ns_from_str("2026-09-03T08:01:01.000000000Z"),
     )
 
@@ -292,12 +252,6 @@ def test_distinct_observations_can_share_payload_identity(
     assert first_response.payload_checksum == second_response.payload_checksum
 
     with database.transaction() as connection:
-        insert_session(
-            connection,
-            schema=database.schema,
-            session=session,
-        )
-
         insert_request(
             connection,
             schema=database.schema,
@@ -372,13 +326,8 @@ def test_response_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-response-conflict",
-    )
-
     request = _request(
         request_id="request-response-conflict",
-        session_id=session.id,
     )
 
     response = _response(
@@ -389,7 +338,6 @@ def test_response_persistence_is_idempotent_and_rejects_identity_conflicts(
 
     _insert_parent_request(
         database,
-        session=session,
         request=request,
     )
 
@@ -446,13 +394,8 @@ def test_response_adapter_metadata_round_trips_through_jsonb(
 
     database = migrated_postgres_database
 
-    session = _session(
-        session_id="session-response-json",
-    )
-
     request = _request(
         request_id="request-response-json",
-        session_id=session.id,
     )
 
     response = _response(
@@ -476,7 +419,6 @@ def test_response_adapter_metadata_round_trips_through_jsonb(
 
     _insert_parent_request(
         database,
-        session=session,
         request=request,
     )
 

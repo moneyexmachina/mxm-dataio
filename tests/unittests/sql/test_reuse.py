@@ -306,7 +306,7 @@ def test_fetch_reuse_candidate_rejects_unexpected_query_results(
 
 
 def test_reuse_query_matches_acquisition_namespace() -> None:
-    """Candidate discovery joins the acquiring Session and Request context."""
+    """Candidate discovery uses the acquiring Request context."""
 
     connection = FakeConnection(
         [
@@ -334,16 +334,17 @@ def test_reuse_query_matches_acquisition_namespace() -> None:
 
     assert '"dataio_test_abc"."responses" AS response' in query_text
     assert '"dataio_test_abc"."requests" AS acquiring_request' in query_text
-    assert '"dataio_test_abc"."sessions" AS acquiring_session' in query_text
 
     assert "acquiring_request.id = response.request_id" in query_text
-    assert "acquiring_session.id = acquiring_request.session_id" in query_text
 
-    assert "acquiring_session.source = %s" in query_text
+    assert "acquiring_request.source = %s" in query_text
     assert "acquiring_request.hash = %s" in query_text
 
-    assert "acquiring_session.as_of_bucket IS NOT DISTINCT FROM %s" in query_text
-    assert "acquiring_session.cache_tag IS NOT DISTINCT FROM %s" in query_text
+    assert "acquiring_request.as_of_bucket IS NOT DISTINCT FROM %s" in query_text
+    assert "acquiring_request.cache_tag IS NOT DISTINCT FROM %s" in query_text
+    assert "acquiring_request.cache_mode" not in query_text
+    assert "acquiring_request.ttl_seconds" not in query_text
+    assert "sessions" not in query_text.lower()
 
     assert execution.parameters == (
         "source-a",
@@ -379,8 +380,8 @@ def test_reuse_query_uses_null_safe_partition_equality() -> None:
         execution.query,
     )
 
-    assert "acquiring_session.as_of_bucket IS NOT DISTINCT FROM %s" in query_text
-    assert "acquiring_session.cache_tag IS NOT DISTINCT FROM %s" in query_text
+    assert "acquiring_request.as_of_bucket IS NOT DISTINCT FROM %s" in query_text
+    assert "acquiring_request.cache_tag IS NOT DISTINCT FROM %s" in query_text
 
     assert execution.parameters == (
         "source-a",
