@@ -36,9 +36,10 @@ dataio = compose_dataio(
 )
 ```
 
-The application owns configuration, secrets, dependency construction, and
-adapter selection. The initial `DataIO` façade only retains these concrete
-dependencies; operational methods are added in later implementation slices.
+The application owns configuration, secrets, dependency construction, adapter
+selection, and adapter lifecycle. The `DataIO` façade binds the configured
+database, payload store, and clock, then delegates request resolution to the
+internal resolution workflow.
 
 ## Overview
 
