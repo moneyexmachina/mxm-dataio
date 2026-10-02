@@ -9,7 +9,7 @@ from typing import Literal, Self, cast
 import pytest
 from psycopg import Connection, sql
 
-from mxm.dataio.models import Resolution, ResolutionKind
+from mxm.dataio.models import Resolution, ResolutionKind, ResponseStatus
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.resolutions import (
     ResolutionConflictError,
@@ -768,7 +768,10 @@ def test_insert_acquired_resolution_encodes_complete_state() -> None:
             # Response relationship validation.
             FakeCursor(
                 rows=[
-                    ("request-1",),
+                    (
+                        "request-1",
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             # INSERT.
@@ -801,6 +804,7 @@ def test_insert_acquired_resolution_encodes_complete_state() -> None:
 
     assert '"dataio_test_abc"."responses"' in response_lookup_text
     assert "SELECT request_id" in response_lookup_text
+    assert "status" in response_lookup_text
     assert "WHERE id = %s" in response_lookup_text
     assert response_lookup.parameters == (resolution.response_id,)
 
@@ -835,7 +839,10 @@ def test_insert_acquired_resolution_rejects_response_from_different_request() ->
         [
             FakeCursor(
                 rows=[
-                    ("request-1",),
+                    (
+                        "request-1",
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
         ]
@@ -876,7 +883,10 @@ def test_insert_reused_resolution_accepts_existing_external_observation() -> Non
             # response-1 was acquired by request-1.
             FakeCursor(
                 rows=[
-                    ("request-1",),
+                    (
+                        "request-1",
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             FakeCursor(),
@@ -925,7 +935,10 @@ def test_insert_reused_resolution_rejects_response_from_same_request() -> None:
         [
             FakeCursor(
                 rows=[
-                    ("request-1",),
+                    (
+                        "request-1",
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
         ]
@@ -944,6 +957,40 @@ def test_insert_reused_resolution_rejects_response_from_same_request() -> None:
         )
 
     assert connection.cursor_calls == 1
+
+
+def test_insert_resolution_rejects_error_response() -> None:
+    """An ERROR Response cannot satisfy a Request."""
+
+    resolution = _resolution()
+
+    connection = FakeConnection(
+        [
+            FakeCursor(
+                rows=[
+                    (
+                        "request-1",
+                        ResponseStatus.ERROR.value,
+                    ),
+                ]
+            ),
+        ]
+    )
+
+    with pytest.raises(
+        ResolutionPersistenceError,
+        match=r"Resolution must reference an OK Response.*response-1.*error",
+    ):
+        insert_resolution(
+            _as_connection(
+                connection,
+            ),
+            schema="dataio_test_abc",
+            resolution=resolution,
+        )
+
+    assert connection.cursor_calls == 1
+    assert len(connection.executions) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -983,20 +1030,45 @@ def test_insert_resolution_rejects_missing_response() -> None:
     "rows",
     [
         [
-            ("request-1",),
-            ("request-1",),
+            (
+                "request-1",
+                ResponseStatus.OK.value,
+            ),
+            (
+                "request-1",
+                ResponseStatus.OK.value,
+            ),
         ],
         [
             (
                 "request-1",
+                ResponseStatus.OK.value,
                 "extra",
             ),
         ],
         [
-            (123,),
+            (
+                123,
+                ResponseStatus.OK.value,
+            ),
         ],
         [
-            ("",),
+            (
+                "",
+                ResponseStatus.OK.value,
+            ),
+        ],
+        [
+            (
+                "request-1",
+                500,
+            ),
+        ],
+        [
+            (
+                "request-1",
+                "unknown",
+            ),
         ],
     ],
 )
@@ -1043,7 +1115,10 @@ def test_insert_resolution_accepts_matching_persisted_state() -> None:
         [
             FakeCursor(
                 rows=[
-                    (resolution.request_id,),
+                    (
+                        resolution.request_id,
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             FakeCursor(),
@@ -1097,7 +1172,10 @@ def test_insert_resolution_rejects_conflicting_persisted_state() -> None:
             # Requested response-1 is structurally valid for request-1.
             FakeCursor(
                 rows=[
-                    ("request-1",),
+                    (
+                        "request-1",
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             FakeCursor(),
@@ -1133,7 +1211,10 @@ def test_insert_resolution_rejects_missing_state_after_insert() -> None:
         [
             FakeCursor(
                 rows=[
-                    (resolution.request_id,),
+                    (
+                        resolution.request_id,
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             FakeCursor(),
@@ -1276,7 +1357,10 @@ def test_resolution_operations_do_not_control_transactions() -> None:
         [
             FakeCursor(
                 rows=[
-                    (resolution.request_id,),
+                    (
+                        resolution.request_id,
+                        ResponseStatus.OK.value,
+                    ),
                 ]
             ),
             FakeCursor(),

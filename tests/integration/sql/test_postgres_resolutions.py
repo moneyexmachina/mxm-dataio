@@ -95,6 +95,7 @@ def _response(
     *,
     response_id: str,
     request_id: str,
+    status: ResponseStatus = ResponseStatus.OK,
     payload: bytes = b"payload",
     created_at: TSNSScalar | None = None,
     fetched_at: TSNSScalar | None = None,
@@ -104,7 +105,7 @@ def _response(
     return Response(
         id=response_id,
         request_id=request_id,
-        status=ResponseStatus.OK,
+        status=status,
         payload_checksum=_checksum(
             payload,
         ),
@@ -340,6 +341,47 @@ def test_reused_resolution_references_existing_observation(
 # ---------------------------------------------------------------------------
 # Resolution semantic consistency
 # ---------------------------------------------------------------------------
+
+
+def test_resolution_rejects_error_response(
+    migrated_postgres_database: PostgresDatabase,
+) -> None:
+    """An ERROR Response cannot satisfy a Request."""
+
+    database = migrated_postgres_database
+
+    request = _request(
+        request_id="request-error",
+    )
+
+    response = _response(
+        response_id="response-error",
+        request_id=request.id,
+        status=ResponseStatus.ERROR,
+    )
+
+    resolution = _resolution(
+        request_id=request.id,
+        response_id=response.id,
+        kind=ResolutionKind.ACQUIRED,
+    )
+
+    _insert_acquired_observation(
+        database,
+        request=request,
+        response=response,
+    )
+
+    with pytest.raises(
+        ResolutionPersistenceError,
+        match=r"Resolution must reference an OK Response",
+    ):
+        with database.transaction() as connection:
+            insert_resolution(
+                connection,
+                schema=database.schema,
+                resolution=resolution,
+            )
 
 
 def test_acquired_resolution_rejects_observation_from_different_request(

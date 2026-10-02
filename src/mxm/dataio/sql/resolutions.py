@@ -37,7 +37,7 @@ from datetime import datetime
 
 from psycopg import Connection, sql
 
-from mxm.dataio.models import Resolution, ResolutionKind
+from mxm.dataio.models import Resolution, ResolutionKind, ResponseStatus
 from mxm.dataio.sql.postgres import PostgresRow
 from mxm.dataio.sql.sql_timestamps import (
     SqlTimestampError,
@@ -189,6 +189,7 @@ def insert_resolution(
 
     Before insertion, the referenced Response relationship is validated:
 
+    - the Response must have ``OK`` status;
     - ``acquired`` requires the Response to have been acquired by the same
       Request occurrence;
     - ``reused`` requires the Response to have been acquired by a different
@@ -299,17 +300,19 @@ def _fetch_rows(
         return cursor.fetchall()
 
 
-def _fetch_response_request_id(
+def _fetch_response_relationship(
     connection: Connection[PostgresRow],
     *,
     schema: str,
     response_id: str,
-) -> str | None:
-    """Return the Request occurrence that acquired one Response."""
+) -> tuple[str, ResponseStatus] | None:
+    """Return one Response's acquiring Request and operational status."""
 
     query = sql.SQL(
         """
-        SELECT request_id
+        SELECT
+            request_id,
+            status
         FROM {}
         WHERE id = %s
         """
@@ -329,15 +332,31 @@ def _fetch_response_request_id(
     if not rows:
         return None
 
-    if len(rows) != 1 or len(rows[0]) != 1:
+    if len(rows) != 1 or len(rows[0]) != 2:
         raise ResolutionPersistenceError(
             "Response lookup returned an unexpected result for "
             f"response_id {response_id!r}: {rows!r}"
         )
 
-    return _require_response_request_id(
+    request_id = _require_response_request_id(
         rows[0][0],
     )
+
+    status_text = _require_text(
+        rows[0][1],
+        field="response_status",
+    )
+
+    try:
+        status = ResponseStatus(
+            status_text,
+        )
+    except ValueError as err:
+        raise ResolutionPersistenceError(
+            f"Persisted Response status is not recognised: {status_text!r}"
+        ) from err
+
+    return request_id, status
 
 
 # ---------------------------------------------------------------------
@@ -434,16 +453,25 @@ def _validate_resolution_response_relationship(
 ) -> None:
     """Validate Resolution kind against Response acquisition provenance."""
 
-    acquiring_request_id = _fetch_response_request_id(
+    relationship = _fetch_response_relationship(
         connection,
         schema=schema,
         response_id=resolution.response_id,
     )
 
-    if acquiring_request_id is None:
+    if relationship is None:
         raise ResolutionPersistenceError(
             "Resolution references a Response that is not persisted: "
             f"response_id={resolution.response_id!r}"
+        )
+
+    acquiring_request_id, response_status = relationship
+
+    if response_status is not ResponseStatus.OK:
+        raise ResolutionPersistenceError(
+            "Resolution must reference an OK Response: "
+            f"response_id={resolution.response_id!r}, "
+            f"response_status={response_status.value!r}"
         )
 
     if resolution.kind is ResolutionKind.ACQUIRED:
