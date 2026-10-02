@@ -1,7 +1,8 @@
 [tool.poetry]
 name = "mxm-dataio"
-version = "0.4.3"
-description = "**Unified ingestion, caching, and audit layer for Money Ex Machina.**"
+version = "0.5.0"
+
+description = "Reproducible and auditable external data acquisition for Money Ex Machina."
 authors = ["mxm <contact@moneyexmachina.com>"]
 license = "MIT"
 readme = "README.md"
@@ -9,7 +10,6 @@ packages = [{ include = "mxm", from = "src" }]
 include = [
   { path = "LICENSE" },
   { path = "src/mxm/dataio/py.typed", format = "wheel" },
-  { path = "src/mxm/dataio/_data/seeds/**/*.yaml", format = "wheel" },
 ]
 
 classifiers = ["Typing :: Typed"]
@@ -18,6 +18,8 @@ classifiers = ["Typing :: Typed"]
 python = ">=3.13, <3.15"
 mxm-config = ">=0.5.2" 
 mxm-types = ">=0.2.2"
+psycopg = {extras = ["binary"], version = "^3.3.4"}
+boto3 = "^1.43.87"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -30,9 +32,11 @@ ruff = "^0.13.2"
 pytest = "^8.4.2"
 ipython = "^9.6.0"
 pyright = "^1.1.406"
-
+testcontainers = {extras = ["postgres"], version = "^4.15.0"}
 
 # ---- Tooling (package-local, MXM defaults) ----
+mypy-boto3-s3 = "^1.43.66"
+boto3-stubs = {extras = ["s3"], version = "^1.43.87"}
 [tool.black]
 line-length = 88
 target-version = ["py313"]
@@ -57,3 +61,7 @@ known-first-party = ["mxm"]
 [tool.pytest.ini_options]
 addopts = "-q"
 pythonpath = ["src"]
+markers = [
+    "postgres: tests requiring a real PostgreSQL database",
+    "s3: integration tests requiring a disposable S3-compatible object server",
+]

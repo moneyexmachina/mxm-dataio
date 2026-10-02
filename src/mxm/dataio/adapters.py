@@ -5,9 +5,8 @@ connect the MXM DataIO layer to external systems. Adapters translate between
 the generic Request/Response model used internally and the specific protocols
 used by each data source, broker, or stream.
 
-Every adapter must satisfy :class:`MXMDataIoAdapter` and may additionally
-implement one or more capability interfaces such as :class:`Fetcher`,
-:class:`Sender`, or :class:`Streamer`.
+Adapters may implement one or more capability interfaces such as
+:class:`Fetcher`, :class:`Sender`, or :class:`Streamer`.
 
 Return semantics
 ----------------
@@ -29,9 +28,6 @@ Example
         def fetch(self, request: Request) -> AdapterResult:
             # perform HTTP GET and return bytes + metadata
             ...
-
-        def describe(self) -> str: ...
-        def close(self) -> None: ...
 """
 
 from collections.abc import AsyncIterator
@@ -62,17 +58,19 @@ class MXMDataIoAdapter(Protocol):
         ...
 
     def close(self) -> None:
-        """Release any held resources (e.g., sessions or sockets)."""
+        """Release any held resources, such as connections or sockets."""
         ...
 
 
-@runtime_checkable
-class Fetcher(MXMDataIoAdapter, Protocol):
+class Fetcher(Protocol):
     """Capability interface for adapters that fetch data (e.g., HTTP GET).
 
     Implementations perform I/O to retrieve external data and must return an
-    :class:`AdapterResult` containing the raw payload and transport metadata.
+    :class:`AdapterResult` containing the exact adapter-boundary payload and
+    acquisition metadata. Applications own adapter construction and lifecycle.
     """
+
+    source: str
 
     def fetch(self, request: Request) -> AdapterResult:
         """Execute the request and return a metadata-rich result."""

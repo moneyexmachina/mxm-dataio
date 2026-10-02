@@ -1,57 +1,66 @@
 """Core data models for mxm-dataio.
 
-This module defines the minimal and deterministic structures used to
-represent all external I/O interactions within the MXM ecosystem.
+mxm-dataio is a durable cache around costly external data acquisitions.
 
-Each interaction is represented by a three-level hierarchy:
+It records:
 
-    Session → Request → Response
+    Request
+        one occurrence of a logical external data question and the resolution
+        context under which it is satisfied
 
-A Session groups multiple Requests under a common logical run
-(e.g., a daily data fetch, a broker connection, or a streaming
-subscription).  Each Request records the intent and parameters of an
-external call, while each Response captures the corresponding outcome.
+    Resolution
+        whether that request was satisfied by a newly acquired response
+        or by reusing an existing cached response
 
-The models are dependency-light, serializable, and future-proof for
-asynchronous or streaming communication patterns.
+    Response
+        one actual reply acquired from the external source
 
-Caching and volatility
-----------------------
-Requests and Responses now include optional caching metadata
-(`cache_mode`, `ttl_seconds`, `as_of_bucket`, `fetched_at`) which
-allow `DataIoSession` to distinguish between volatile and stable
-sources, control cache reuse policies, and persist provenance for
-every collected payload.  These fields are informational only; all
-policy logic lives in the runtime API layer.
+    AdapterResult
+        the exact payload bytes and operational result produced by the
+        source adapter
+
+Payload bytes themselves are persisted separately through PayloadStore and
+are identified by their SHA-256 checksum.
+
+DataIO deliberately does not interpret source data semantically. Parsing,
+normalization, dataset semantics, and MXM epistemic state belong to layers
+above mxm-dataio.
+
+Timestamps use the canonical MXM timestamp representation from mxm-types.
+Models do not acquire wall-clock time themselves; timestamps are supplied
+explicitly by the runtime that creates or updates the records.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
 from enum import Enum
 
-from mxm.types import HeadersLike, JSONLike, JSONMap, JSONObj
+from mxm.types import JSONLike, JSONMap, JSONObj
+from mxm.types.timestamps import TSNSScalar
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
 # --------------------------------------------------------------------------- #
 
 
-def _utcnow() -> datetime:
-    """Return the current UTC timestamp with explicit tzinfo."""
-    return datetime.now(tz=UTC)
-
-
 def _uuid() -> str:
     """Generate a unique identifier as a string."""
+
     return str(uuid.uuid4())
 
 
 def _json_dumps(data: JSONLike) -> str:
-    """Deterministically serialize a Python object to JSON."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """Deterministically serialize a JSON-compatible value."""
+
+    return json.dumps(
+        data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -59,35 +68,53 @@ def _json_dumps(data: JSONLike) -> str:
 # --------------------------------------------------------------------------- #
 
 
-class SessionMode(str, Enum):
-    """Operational mode of a session."""
+class CacheMode(str, Enum):
+    """Policy governing reuse of previously acquired responses.
 
-    SYNC = "sync"
-    ASYNC = "async"
-    BATCH = "batch"
+    DEFAULT
+        Reuse the newest eligible cached response when one exists.
+        Otherwise acquire and persist a new response.
 
+    ONLY_IF_CACHED
+        Reuse the newest eligible cached response when one exists.
+        Otherwise fail without contacting the external source.
 
-class RequestMethod(str, Enum):
-    """Generalized method or verb for external I/O requests."""
+    BYPASS
+        Do not consider cached responses. Always acquire and persist a new
+        response.
+    """
 
-    GET = "GET"
-    POST = "POST"
-    SEND = "SEND"
-    SUBSCRIBE = "SUBSCRIBE"
-    COMMAND = "COMMAND"
+    DEFAULT = "default"
+    ONLY_IF_CACHED = "only_if_cached"
+    BYPASS = "bypass"
 
 
 class ResponseStatus(str, Enum):
-    """Canonical response status values."""
+    """Operational classification of an acquired external reply.
+
+    The source adapter assigns this classification.
+
+    OK
+        The external interaction produced a complete valid answer to the
+        logical request. DataIO does not interpret the semantic content of
+        that answer; a valid "no data" reply may therefore still be OK.
+
+    ERROR
+        The external interaction produced a reply that does not constitute a
+        valid reusable answer to the request.
+
+    Only OK responses are eligible for cache reuse.
+    """
 
     OK = "ok"
     ERROR = "error"
-    PARTIAL = "partial"
-    STREAM_OPEN = "stream_open"
-    STREAM_MESSAGE = "stream_message"
-    STREAM_CLOSED = "stream_closed"
-    ACK = "ack"
-    NACK = "nack"
+
+
+class ResolutionKind(str, Enum):
+    """How one Request occurrence was satisfied."""
+
+    ACQUIRED = "acquired"
+    REUSED = "reused"
 
 
 # --------------------------------------------------------------------------- #
@@ -95,220 +122,237 @@ class ResponseStatus(str, Enum):
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(slots=True)
-class Session:
-    """Logical ingestion or I/O session grouping multiple requests."""
-
-    source: str
-    mode: SessionMode = SessionMode.SYNC
-    as_of: datetime = field(default_factory=_utcnow)
-    id: str = field(default_factory=_uuid)
-    started_at: datetime = field(default_factory=_utcnow)
-    ended_at: datetime | None = None
-
-    def end(self) -> None:
-        """Mark the session as completed."""
-        self.ended_at = _utcnow()
-
-
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Request:
-    """Represents a single external I/O request.
+    """One immutable occurrence of a logical external data question.
 
-    Requests may represent read operations (e.g., data downloads),
-    write operations (e.g., order placement), or control messages
-    (e.g., subscribe/unsubscribe).  They are hashable and fully
-    deterministic given identical parameters.
+    ``id`` identifies this individual Request occurrence.
 
-    Caching metadata
-    ----------------
-    The optional fields `cache_mode`, `ttl_seconds`, and `as_of_bucket`
-    record the policy context under which the request was executed.
-    They are also incorporated into the deterministic request hash,
-    ensuring that time-bucketed or TTL-sensitive requests produce
-    distinct fingerprints.
+    ``source`` identifies the external source adapter namespace and forms part
+    of the reuse namespace.
+
+    ``kind`` identifies the logical vendor operation, for example
+    ``"databento.timeseries.get_range"``.
+
+    ``params`` contains the canonical logical arguments to that operation.
+    Transport details such as HTTP method, query-string versus request-body
+    placement, SDK invocation shape, authentication, and pagination belong to
+    the source adapter and are deliberately absent from Request.
+
+    ``hash`` identifies the logical question itself. It is derived only from
+    ``kind`` and ``params``.
+
+    ``cache_mode`` and ``ttl_seconds`` record the caller-supplied reuse policy
+    for this Request occurrence.
+
+    ``as_of_bucket`` and ``cache_tag`` are opaque caller-supplied reuse
+    partition coordinates. DataIO compares them for equality but assigns no
+    temporal, versioning, or domain semantics to them.
+
+    Resolution context deliberately does not participate in the question hash.
+
+    ``created_at`` records when this Request occurrence was created. The
+    runtime supplies the timestamp.
     """
 
-    session_id: str
+    source: str
     kind: str
-    method: RequestMethod = RequestMethod.GET
+    cache_mode: CacheMode
+    created_at: TSNSScalar
+
     params: JSONObj | None = None
-    body: JSONLike | None = None
-    id: str = field(default_factory=_uuid)
-    created_at: datetime = field(default_factory=_utcnow)
-    cache_mode: str | None = None
     ttl_seconds: float | None = None
     as_of_bucket: str | None = None
     cache_tag: str | None = None
+
+    id: str = field(default_factory=_uuid)
     hash: str = field(init=False)
 
     def __post_init__(self) -> None:
-        """Compute a deterministic hash for the request."""
+        """Compute the deterministic logical-question identity."""
+
         base: JSONLike = {
+            "kind": self.kind,
             "params": self.params,
-            "body": self.body,
-            "as_of_bucket": self.as_of_bucket,
-            "cache_tag": self.cache_tag,
         }
-        serialized = _json_dumps(base)
-        self.hash = hashlib.sha256(
-            f"{self.kind}:{self.method}:{serialized}".encode()
-        ).hexdigest()
 
-    def to_json(self) -> str:
-        """Return a JSON string representation of this request."""
-        return _json_dumps(asdict(self))
+        object.__setattr__(
+            self,
+            "hash",
+            hashlib.sha256(
+                _json_dumps(base).encode(),
+            ).hexdigest(),
+        )
 
 
-@dataclass(slots=True)
-class Response:
-    """Represents the outcome of a single request.
+@dataclass(frozen=True, slots=True)
+class Resolution:
+    """Immutable record of how one Request occurrence was satisfied.
 
-    Responses may be one-off (for synchronous calls) or sequential
-    (for streaming or asynchronous interactions).  Each response stores
-    a checksum for integrity verification and can reference a file path
-    to the persisted payload.
+    ``request_id`` identifies the Request occurrence being resolved.
 
-    Provenance and caching
-    ----------------------
-    Each response records its `fetched_at` timestamp and inherits the
-    caching context (`cache_mode`, `ttl_seconds`, `as_of_bucket`) from
-    the originating request.  These values enable reproducible
-    re-validation and cache-audit workflows, but do not affect checksum
-    computation or integrity verification.
+    ``response_id`` identifies the Response whose payload satisfied that
+    Request.
+
+    ``kind`` records whether the Response was newly acquired for this Request
+    or reused from an earlier acquisition.
+
+    One Request occurrence has at most one final Resolution, so ``request_id``
+    is sufficient as the persistence identity.
+
+    For ACQUIRED:
+
+        Response.request_id == Resolution.request_id
+
+    For REUSED:
+
+        Response.request_id != Resolution.request_id
+
+    ``resolved_at`` is supplied by the runtime.
     """
 
     request_id: str
-    status: ResponseStatus = ResponseStatus.OK
-    checksum: str | None = None
-    path: str | None = None
-    created_at: datetime = field(default_factory=_utcnow)
-    id: str = field(default_factory=_uuid)
-    sequence: int | None = None
-    size_bytes: int | None = None
+    response_id: str
+    kind: ResolutionKind
+    resolved_at: TSNSScalar
 
-    # Provenance / caching metadata (taken from Request)
-    fetched_at: datetime = field(default_factory=_utcnow)
-    cache_mode: str | None = None
-    ttl_seconds: float | None = None
-    as_of_bucket: str | None = None
-    cache_tag: str | None = None
+
+@dataclass(frozen=True, slots=True)
+class Response:
+    """One immutable reply actually acquired from an external source.
+
+    ``id`` identifies this individual external response occurrence.
+
+    ``request_id`` identifies the Request occurrence that actually contacted
+    the external source and acquired this Response.
+
+    ``status`` is the generic operational classification assigned by the
+    source adapter.
+
+    ``payload_checksum`` identifies the exact payload bytes acquired at the
+    adapter boundary. Distinct Responses may legitimately reference the same
+    checksum when repeated external calls return byte-for-byte identical data.
+
+    ``fetched_at`` records when the external response was acquired. It carries
+    cache-freshness meaning.
+
+    ``created_at`` records when the Response record was created.
+
+    Both timestamps are supplied explicitly by the runtime.
+
+    Generic representation and acquisition metadata are represented directly.
+    Source- or protocol-specific facts remain opaque in ``adapter_meta``.
+    """
+
+    request_id: str
+    status: ResponseStatus
+    payload_checksum: str
+    size_bytes: int
+    created_at: TSNSScalar
+    fetched_at: TSNSScalar
+
+    id: str = field(default_factory=_uuid)
+
+    media_type: str | None = None
+    encoding: str | None = None
+    elapsed_ms: int | None = None
+    adapter_meta: JSONObj | None = None
 
     @classmethod
     def from_bytes(
         cls,
+        *,
         request_id: str,
         status: ResponseStatus,
         data: bytes,
-        path: str,
-        sequence: int | None = None,
-    ) -> "Response":
-        """Create a Response object from raw bytes."""
-        checksum = hashlib.sha256(data).hexdigest()
+        created_at: TSNSScalar,
+        fetched_at: TSNSScalar,
+    ) -> Response:
+        """Create a Response from exact external payload bytes."""
+
         return cls(
             request_id=request_id,
             status=status,
-            checksum=checksum,
-            path=path,
-            sequence=sequence,
+            payload_checksum=hashlib.sha256(data).hexdigest(),
             size_bytes=len(data),
+            created_at=created_at,
+            fetched_at=fetched_at,
         )
 
     @classmethod
     def from_adapter_result(
         cls,
+        *,
         request_id: str,
-        status: ResponseStatus,
-        result: "AdapterResult",
-        path: str,
-        sequence: int | None = None,
-    ) -> "Response":
-        """Create a Response from an AdapterResult (checksum/size derived
-        from bytes)."""
-        return cls.from_bytes(
+        result: AdapterResult,
+        created_at: TSNSScalar,
+        fetched_at: TSNSScalar,
+    ) -> Response:
+        """Create a Response from one source-adapter acquisition result."""
+
+        return cls(
             request_id=request_id,
-            status=status,
-            data=result.data,
-            path=path,
-            sequence=sequence,
+            status=result.status,
+            payload_checksum=hashlib.sha256(result.data).hexdigest(),
+            size_bytes=len(result.data),
+            created_at=created_at,
+            fetched_at=fetched_at,
+            media_type=result.media_type,
+            encoding=result.encoding,
+            elapsed_ms=result.elapsed_ms,
+            adapter_meta=(
+                dict(result.adapter_meta) if result.adapter_meta is not None else None
+            ),
         )
 
-    def verify(self, data: bytes) -> bool:
-        """Return True if the given data matches the stored checksum."""
-        if self.checksum is None:
-            return False
-        return hashlib.sha256(data).hexdigest() == self.checksum
+    def verify_payload(self, data: bytes) -> bool:
+        """Return whether bytes match this Response's payload identity."""
+
+        return hashlib.sha256(data).hexdigest() == self.payload_checksum
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class AdapterResult:
-    """Unified return envelope for adapters.
+    """Result of one actual external acquisition performed by an adapter.
 
-    Adapters may return either:
-      • raw bytes (status quo), or
-      • an AdapterResult carrying bytes + transport metadata.
+    ``status`` is the adapter's generic operational classification of the
+    external reply.
 
-    The `data` field contains the exact payload to persist under checksum.
-    All other fields are optional metadata that can be stored as a sidecar
-    JSON alongside the payload for inspection/replay.
+    ``data`` contains the exact payload bytes presented to DataIO at the
+    adapter boundary. DataIO does not semantically transform these bytes before
+    deriving payload identity or persisting them.
 
-    Fields
-    ------
-    data:
-        Raw payload bytes from the external system (exact as received).
-    content_type:
-        MIME type if known (e.g., "application/json", "text/csv").
-    encoding:
-        Text encoding if applicable (e.g., "utf-8").
-    transport_status:
-        Transport-layer status code (e.g., HTTP status).
-    url:
-        Final request URL after redirects, if relevant.
-    elapsed_ms:
-        End-to-end elapsed time in milliseconds.
-    headers:
-        Flattened response headers (string-valued).
-    adapter_meta:
-        Free-form, source-specific metadata (rate limits, request id, etc.).
+    Generic representation and acquisition metadata may be provided directly.
+
+    Source-, SDK-, or protocol-specific metadata belongs in ``adapter_meta``.
+    DataIO persists those values but assigns no semantics to them.
     """
 
+    status: ResponseStatus
     data: bytes
-    content_type: str | None = None
+
+    media_type: str | None = None
     encoding: str | None = None
-    transport_status: int | None = None
-    url: str | None = None
     elapsed_ms: int | None = None
-    headers: HeadersLike | None = None
     adapter_meta: JSONObj | None = None
 
     def meta_dict(self) -> JSONMap:
-        """Return a JSON-serializable dict of all non-payload metadata."""
+        """Return generic metadata for legacy persistence callers.
+
+        This compatibility helper can be removed when the legacy DataIO runtime
+        and filesystem sidecar persistence path have been retired.
+        """
 
         result: JSONMap = {}
 
-        if self.content_type is not None:
-            result["content_type"] = self.content_type
+        if self.media_type is not None:
+            result["media_type"] = self.media_type
 
         if self.encoding is not None:
             result["encoding"] = self.encoding
 
-        if self.transport_status is not None:
-            result["transport_status"] = self.transport_status
-
-        if self.url is not None:
-            result["url"] = self.url
-
         if self.elapsed_ms is not None:
             result["elapsed_ms"] = self.elapsed_ms
-
-        if self.headers is not None:
-            headers_map: JSONMap = {}
-            for key, value in self.headers.items():
-                if isinstance(value, str):
-                    headers_map[key] = value
-                else:
-                    headers_map[key] = list(value)
-            result["headers"] = headers_map
 
         if self.adapter_meta is not None:
             result["adapter_meta"] = dict(self.adapter_meta)
