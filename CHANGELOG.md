@@ -4,7 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on **Keep a Changelog**, and this project adheres to **Semantic Versioning**.
 
-## Unreleased
+## [Unreleased]
+
+## [0.5.0] - 2026-10-02
+
+### Changed
+
+- Replaced the legacy Session and adapter-registry architecture with an
+  explicitly composed `DataIO` capability.
+- Added the public `DataIO.resolve()` workflow and its `ResolveResult` and
+  `CacheMissError` contracts.
+- Moved source identity and reuse-policy context directly onto each Request
+  occurrence.
+- Added policy-aware response reuse with orthogonal cache-mode and TTL
+  semantics.
+- Added explicit adapter acquisition that preserves exact adapter-boundary
+  bytes through `PayloadStore`.
+- Added the Request, Response, and Resolution workflow with atomic persistence
+  of successful acquired Responses and their ACQUIRED Resolutions.
+- Required callers to supply adapters explicitly and retain ownership of
+  adapter construction and lifecycle.
+- Defined ERROR Responses as persisted external observations that do not
+  resolve Requests.
+- Added PostgreSQL and S3 integration coverage for relational provenance,
+  transaction invariants, and content-addressed payload storage.
+
+### Removed
+
+- Removed `DataIoSession` and Session persistence.
+- Removed the global adapter registry and runtime adapter discovery.
+- Removed superseded cache, configuration, and filesystem Store APIs.
+- Removed filesystem-path-based payload consumption from the DataIO contract.
+
 ## [0.4.3] - 2026-05-12
 
 ### Changed
